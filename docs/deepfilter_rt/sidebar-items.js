@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_NORM_ALPHA","DF_ORDER","FFT_SIZE","FREQ_SIZE","HOP_SIZE","MAX_DB_DF_THRESH","MAX_DB_ERB_THRESH","MIN_DB_THRESH","NB_DF","NB_ERB","SAMPLE_RATE"],"enum":["DfError","ModelVariant"],"struct":["DeepFilterProcessor","DeepFilterStream"],"type":["Result"]};

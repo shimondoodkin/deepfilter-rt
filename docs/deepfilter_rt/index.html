@@ -1,0 +1,88 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="DeepFilter-RT"><title>deepfilter_rt - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2" crossorigin href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-1a91846b.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="deepfilter_rt" data-themes="" data-resource-suffix="" data-rustdoc-version="1.88.0 (6b00bc388 2025-06-23)" data-channel="1.88.0" data-search-js="search-f7877310.js" data-settings-js="settings-5514c975.js" ><script src="../static.files/storage-4e99c027.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-7ef8a74a.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-893ab5e7.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-6580c154.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="mobile-topbar"><button class="sidebar-menu-toggle" title="show sidebar"></button></nav><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../deepfilter_rt/index.html">deepfilter_<wbr>rt</a><span class="version">0.1.0</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#deepfilter-rt" title="DeepFilter-RT">DeepFilter-RT</a><ul><li><a href="#quick-start" title="Quick Start">Quick Start</a></li><li><a href="#model-variants" title="Model Variants">Model Variants</a></li><li><a href="#audio-requirements" title="Audio Requirements">Audio Requirements</a></li><li><a href="#api-levels" title="API Levels">API Levels</a></li><li><a href="#thread-count" title="Thread Count">Thread Count</a></li><li><a href="#hardware-acceleration" title="Hardware Acceleration">Hardware Acceleration</a></li><li><a href="#android-setup" title="Android Setup">Android Setup</a></li><li><a href="#logging" title="Logging">Logging</a></li><li><a href="#thread-safety" title="Thread Safety">Thread Safety</a></li></ul></li></ul><h3><a href="#structs">Crate Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#types" title="Type Aliases">Type Aliases</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer"></div><main><div class="width-limiter"><rustdoc-search></rustdoc-search><section id="main-content" class="content"><div class="main-heading"><h1>Crate <span>deepfilter_rt</span><button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/deepfilter_rt/lib.rs.html#1-1078">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><h2 id="deepfilter-rt"><a class="doc-anchor" href="#deepfilter-rt">§</a>DeepFilter-RT</h2>
+<p>Real-time noise suppression using DeepFilterNet neural network with ONNX Runtime inference.</p>
+<p>This crate provides audio enhancement for real-time applications such as voice calls,
+streaming, and live audio processing. It implements the two-stage DeepFilterNet algorithm:
+ERB-based spectral masking followed by deep filtering on low frequencies.</p>
+<h3 id="quick-start"><a class="doc-anchor" href="#quick-start">§</a>Quick Start</h3>
+<p>Use <a href="struct.DeepFilterStream.html" title="struct deepfilter_rt::DeepFilterStream"><code>DeepFilterStream</code></a> for the simplest API - it handles buffering internally:</p>
+
+<div class="example-wrap ignore"><a href="#" class="tooltip" title="This example is not tested">ⓘ</a><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deepfilter_rt::DeepFilterStream;
+
+<span class="kw">let </span><span class="kw-2">mut </span>stream = DeepFilterStream::new(Path::new(<span class="string">"models/dfn3"</span>))<span class="question-mark">?</span>;
+stream.warmup()<span class="question-mark">?</span>;
+
+<span class="comment">// Process any length of audio (must be 48kHz mono f32)
+</span><span class="kw">let </span>enhanced = stream.process(<span class="kw-2">&amp;</span>input_samples)<span class="question-mark">?</span>;</code></pre></div>
+<h3 id="model-variants"><a class="doc-anchor" href="#model-variants">§</a>Model Variants</h3><div><table><thead><tr><th>Variant</th><th>Folder</th><th>Latency</th><th>Mode</th><th>Use Case</th></tr></thead><tbody>
+<tr><td>DeepFilterNet2</td><td><code>dfn2</code></td><td>30ms</td><td>Stateless</td><td>General purpose</td></tr>
+<tr><td>DeepFilterNet2-LL</td><td><code>dfn2_ll</code></td><td>10ms</td><td>Stateless</td><td>Low-latency</td></tr>
+<tr><td>DeepFilterNet2-H0</td><td><code>dfn2_h0</code></td><td>30ms</td><td>Stateful</td><td>Best quality (GRU)</td></tr>
+<tr><td>DeepFilterNet3</td><td><code>dfn3</code></td><td>30ms</td><td>Stateless</td><td>High quality</td></tr>
+<tr><td>DeepFilterNet3-LL</td><td><code>dfn3_ll</code></td><td>10ms</td><td>Stateless</td><td>Real-time</td></tr>
+<tr><td>DeepFilterNet3-H0</td><td><code>dfn3_h0</code></td><td>30ms</td><td>Stateful</td><td>Best quality (GRU)</td></tr>
+</tbody></table>
+</div>
+<p>Variant is auto-detected from the model folder name and <code>config.ini</code>.</p>
+<h3 id="audio-requirements"><a class="doc-anchor" href="#audio-requirements">§</a>Audio Requirements</h3>
+<ul>
+<li><strong>Sample rate</strong>: 48 kHz (resample before processing if needed)</li>
+<li><strong>Format</strong>: Mono f32 samples in range [-1.0, 1.0]</li>
+</ul>
+<h3 id="api-levels"><a class="doc-anchor" href="#api-levels">§</a>API Levels</h3>
+<ul>
+<li>
+<p><a href="struct.DeepFilterStream.html" title="struct deepfilter_rt::DeepFilterStream"><code>DeepFilterStream</code></a> - High-level streaming API. Handles buffering internally.
+Pass any length of samples, get enhanced audio back.</p>
+</li>
+<li>
+<p><a href="struct.DeepFilterProcessor.html" title="struct deepfilter_rt::DeepFilterProcessor"><code>DeepFilterProcessor</code></a> - Low-level frame API for integration with audio callbacks.
+You manage 480-sample frames yourself (10ms at 48kHz).</p>
+</li>
+</ul>
+<h3 id="thread-count"><a class="doc-anchor" href="#thread-count">§</a>Thread Count</h3>
+<p>The <code>with_threads</code> constructors control ONNX Runtime’s intra-op parallelism:</p>
+<ul>
+<li><strong>Real-time audio</strong>: Use 1-2 threads to minimize latency jitter</li>
+<li><strong>Batch/offline</strong>: Use more threads (4-8) for throughput</li>
+<li><strong>Default</strong>: ONNX Runtime picks based on CPU cores</li>
+</ul>
+<h3 id="hardware-acceleration"><a class="doc-anchor" href="#hardware-acceleration">§</a>Hardware Acceleration</h3>
+<p>Enable via Cargo features:</p>
+<div class="example-wrap"><pre class="language-toml"><code># Android GPU/NPU (NNAPI)
+deepfilter-rt = { path = &quot;...&quot;, features = [&quot;nnapi&quot;] }
+
+# Android with fp16 relaxation (faster, slightly lower quality)
+deepfilter-rt = { path = &quot;...&quot;, features = [&quot;nnapi&quot;, &quot;fp16&quot;] }</code></pre></div>
+<p>With <code>fp16</code> enabled, the processing pipeline looks like:</p>
+<div class="example-wrap"><pre class="language-text"><code>Audio (i16) → f32 → [STFT f32] → [NNAPI: f32→fp16→inference→fp16→f32] → [ISTFT f32] → f32
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                  Only this part uses fp16 internally</code></pre></div>
+<p>The API remains f32 throughout. The fp16 benefit is faster matrix ops on NPU/GPU,
+not reduced conversion overhead.</p>
+<div class="example-wrap"><pre class="language-toml"><code>
+# iOS/macOS (CoreML)
+deepfilter-rt = { path = &quot;...&quot;, features = [&quot;coreml&quot;] }
+
+# NVIDIA GPU (CUDA)
+deepfilter-rt = { path = &quot;...&quot;, features = [&quot;cuda&quot;] }</code></pre></div><h3 id="android-setup"><a class="doc-anchor" href="#android-setup">§</a>Android Setup</h3>
+<p>See <code>ONNX_RUNTIME_ANDROID_SETUP.md</code> for complete instructions:</p>
+<ol>
+<li>Download <code>libonnxruntime.so</code> from Maven Central (version 1.23.x for ort 2.0.0-rc.11)</li>
+<li>Place in <code>android/app/src/main/jniLibs/{arch}/</code></li>
+<li>Build with: <code>cargo ndk -t arm64-v8a build --release --features "nnapi,fp16"</code></li>
+</ol>
+<h3 id="logging"><a class="doc-anchor" href="#logging">§</a>Logging</h3>
+<p>This crate uses the <code>log</code> crate for debug/info messages. On Android, configure
+<code>android_logger</code> once in your app’s initialization (shared across all Rust crates):</p>
+
+<div class="example-wrap ignore"><a href="#" class="tooltip" title="This example is not tested">ⓘ</a><pre class="rust rust-example-rendered"><code><span class="comment">// In your app's init code (not in deepfilter-rt)
+</span>android_logger::init_once(
+    android_logger::Config::default()
+        .with_max_level(log::LevelFilter::Debug)
+        .with_tag(<span class="string">"MyApp"</span>),
+);</code></pre></div>
+<p>View logs with: <code>adb logcat | grep MyApp</code></p>
+<h3 id="thread-safety"><a class="doc-anchor" href="#thread-safety">§</a>Thread Safety</h3>
+<p>Each processor instance is independent and <code>Send</code>. Create separate instances
+for parallel processing - they do not share state.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.DeepFilterProcessor.html" title="struct deepfilter_rt::DeepFilterProcessor">Deep<wbr>Filter<wbr>Processor</a></dt><dd>Real-time DeepFilterNet processor</dd><dt><a class="struct" href="struct.DeepFilterStream.html" title="struct deepfilter_rt::DeepFilterStream">Deep<wbr>Filter<wbr>Stream</a></dt><dd>High-level streaming API with automatic buffering.</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.DfError.html" title="enum deepfilter_rt::DfError">DfError</a></dt><dt><a class="enum" href="enum.ModelVariant.html" title="enum deepfilter_rt::ModelVariant">Model<wbr>Variant</a></dt><dd>Model variant (auto-detected from folder name and config.ini).</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.DEFAULT_NORM_ALPHA.html" title="constant deepfilter_rt::DEFAULT_NORM_ALPHA">DEFAULT_<wbr>NORM_<wbr>ALPHA</a></dt><dt><a class="constant" href="constant.DF_ORDER.html" title="constant deepfilter_rt::DF_ORDER">DF_<wbr>ORDER</a></dt><dt><a class="constant" href="constant.FFT_SIZE.html" title="constant deepfilter_rt::FFT_SIZE">FFT_<wbr>SIZE</a></dt><dt><a class="constant" href="constant.FREQ_SIZE.html" title="constant deepfilter_rt::FREQ_SIZE">FREQ_<wbr>SIZE</a></dt><dt><a class="constant" href="constant.HOP_SIZE.html" title="constant deepfilter_rt::HOP_SIZE">HOP_<wbr>SIZE</a></dt><dt><a class="constant" href="constant.MAX_DB_DF_THRESH.html" title="constant deepfilter_rt::MAX_DB_DF_THRESH">MAX_<wbr>DB_<wbr>DF_<wbr>THRESH</a></dt><dt><a class="constant" href="constant.MAX_DB_ERB_THRESH.html" title="constant deepfilter_rt::MAX_DB_ERB_THRESH">MAX_<wbr>DB_<wbr>ERB_<wbr>THRESH</a></dt><dt><a class="constant" href="constant.MIN_DB_THRESH.html" title="constant deepfilter_rt::MIN_DB_THRESH">MIN_<wbr>DB_<wbr>THRESH</a></dt><dt><a class="constant" href="constant.NB_DF.html" title="constant deepfilter_rt::NB_DF">NB_DF</a></dt><dt><a class="constant" href="constant.NB_ERB.html" title="constant deepfilter_rt::NB_ERB">NB_ERB</a></dt><dt><a class="constant" href="constant.SAMPLE_RATE.html" title="constant deepfilter_rt::SAMPLE_RATE">SAMPLE_<wbr>RATE</a></dt></dl><h2 id="types" class="section-header">Type Aliases<a href="#types" class="anchor">§</a></h2><dl class="item-table"><dt><a class="type" href="type.Result.html" title="type deepfilter_rt::Result">Result</a></dt></dl></section></div></main></body></html>

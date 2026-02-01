@@ -1,0 +1,48 @@
+[package]
+name = "deepfilter-rt"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time DeepFilterNet enhancement using ONNX Runtime"
+
+[dependencies]
+# DF crate for STFT/ISTFT and signal processing
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", package = "deep_filter" }
+
+# ONNX Runtime - using ort 2.x API
+# Note: 2.0.0 stable not yet released, using rc.11
+# Using load-dynamic to avoid static linking issues on Windows/Android
+ort = { version = "2.0.0-rc.11", default-features = false, features = ["ndarray", "load-dynamic"] }
+
+# Array operations (ort 2.0.0-rc.11 requires ndarray 0.16)
+ndarray = "0.16"
+
+# Complex numbers (re-export from df)
+num-complex = "0.4"
+
+# Error handling
+thiserror = "1.0"
+
+# Logging (optional, users typically configure android_logger separately)
+log = "0.4"
+
+[dev-dependencies]
+hound = "3.5"
+
+[features]
+default = []
+
+# GPU/NPU acceleration
+cuda = ["ort/cuda"]
+coreml = ["ort/coreml"]
+nnapi = ["ort/nnapi"]
+
+# Relaxed precision (combine with EP features)
+# Enables fp16 internally for faster inference - API remains f32
+# Example: features = ["nnapi", "fp16"] for Android with half-precision
+fp16 = []
+
+# Alternative: use df's built-in tract inference (no ONNX needed)
+# Uncomment to use tract instead of ort
+# [dependencies.deep_filter]
+# git = "https://github.com/Rikorose/DeepFilterNet"
+# features = ["tract", "default-model"]
