@@ -1,126 +1,107 @@
-# DeepFilterNet ONNX Stateful Export (Rust realtime)
+# DeepFilterNet ONNX Stateful Export
 
-This document explains how to build **stateful** ONNX models for DeepFilterNet so the
-Rust realtime pipeline matches Python (GRU hidden state preserved across frames).
-
-If you are new to DeepFilterNet or ONNX, follow the **Step?by?step** section.
+This document explains how to export **stateful** (GRU) ONNX models for DeepFilterNet
+so the Rust pipeline preserves hidden state across frames.
 
 ## Why this is needed
 
-The standard ONNX encoder export for DeepFilterNet3 does **not** include GRU state inputs/outputs.
+The standard ONNX encoder export does **not** include GRU state inputs/outputs.
 Rust realtime inference runs the encoder per small chunk, so without GRU state the encoder
-outputs (and therefore masks/DF coefficients) diverge from Python. This causes artifacts
-(choppy or ?mask?like? sound).
+outputs diverge from Python. This causes artifacts (choppy or mask-like sound).
 
-The fix is to export a **stateful** encoder that has:
+The fix is to export a **stateful** encoder with:
 
 - inputs: `feat_erb`, `feat_spec`, `h0`
 - outputs: `e0, e1, e2, e3, emb, c0, lsnr, h1`
 
 Rust keeps `h1` and feeds it back as `h0` for the next frame.
 
-## Quick start (step?by?step)
+## Quick start
 
-1) **Check you are in the right repo**
+### 1. Install Python dependencies
 
-```
-cd C:\Users\user\Documents\projects\aiphone\deepfilter_rt
-```
-
-2) **Pick a target model directory**
-
-Example targets:
-- `C:\Users\user\Documents\projects\aiphone\deepfilter_rt\models\dfn3_h0`
-- `C:\Users\user\Documents\projects\aiphone\deepfilter_rt\models\dfn2_h0`
-
-3) **Edit the export script**
-
-Open:
-`C:\Users\user\Documents\projects\aiphone\beam_stt\export_onnx_stateful.py`
-
-Find:
-`export_dir = r"..."`
-
-Set it to your target model directory from step 2.
-
-4) **Run the export**
-
-```
-C:\Users\user\Documents\projects\aiphone\beam_stt\.venv310\Scripts\python.exe C:\Users\user\Documents\projects\aiphone\beam_stt\export_onnx_stateful.py
+```bash
+pip install torch deepfilternet onnx
 ```
 
-This overwrites in the target model folder:
-- `enc.onnx`
+### 2. Export stateful ONNX models
+
+The export script is included at `scripts/export_onnx_stateful.py`:
+
+```bash
+# Export to a model directory (e.g. dfn3_h0)
+python scripts/export_onnx_stateful.py models/dfn3_h0
+
+# Optionally provide a 48kHz WAV for tracing (uses synthetic audio if omitted)
+python scripts/export_onnx_stateful.py models/dfn3_h0 audio_48k.wav
+```
+
+This produces in the target directory:
+- `enc.onnx` (stateful encoder with h0/h1)
 - `erb_dec.onnx`
 - `df_dec.onnx`
 - `config.ini` (copied from DeepFilterNet cache if found)
 
-5) **Test in Rust**
+### 3. Merge into combined model
 
+```bash
+pip install -r scripts/requirements.txt
+python scripts/merge_onnx.py models/dfn3_h0
 ```
-cargo run --example process_file -- input.wav output.wav models\dfn3_h0
+
+### 4. Test in Rust
+
+```bash
+cargo run --example process_file -- input.wav output.wav models/dfn3_h0
 ```
 
-You should hear clean output (not choppy). If artifacts return, re?export stateful ONNX.
+You should hear clean output (not choppy).
 
-## What this changes in Rust
+## How it works in Rust
 
-The Rust pipeline automatically detects if `enc.onnx` has `h0`:
+The Rust pipeline automatically detects if `combined.onnx` has an `h0` input:
 
-- If `h0` exists, it runs **stateful** inference and keeps GRU state across frames.
-- If not, it runs stateless inference (which **will not** match Python).
+- If `h0` exists: runs **stateful** inference, preserves GRU state across frames
+- If not: runs stateless inference (windowed encoder context)
 
-Key changes are in `deepfilter_rt/src/lib.rs`:
+Key behavior in `lib.rs`:
+- `enc_h` buffer stores GRU hidden state
+- On inference: passes `h0` tensor, reads `h1` output, stores it for next frame
+- On reset: clears `enc_h` to zeros
 
-- Added `enc_h` buffer for GRU hidden state
-- Added `enc_stateful` flag (checks for `h0` input on encoder session)
-- On reset, clears `enc_h`
-- On inference:
-  - pass `h0` tensor into encoder
-  - read `h1` and store into `enc_h`
+## Model variants
 
-## Current state in this repo
-
-The following model folders were duplicated with `_h0` suffix:
-
-- `models\dfn2_h0` (stateful export applied)
-- `models\dfn3_h0` (stateful export applied)
-- `models\dfn2_ll_h0` (copied, but **not** stateful export; see note)
-- `models\dfn3_ll_h0` (copied, but **not** stateful export; see note)
-
-**Important note about LL models**
-
-The official Python package only ships checkpoints for:
-
-- `DeepFilterNet2`
-- `DeepFilterNet3`
-
-It does **not** include `DeepFilterNet2_ll` or `DeepFilterNet3_ll` checkpoints,
-so we cannot export stateful ONNX for LL models using the Python package alone.
-If you obtain LL checkpoints, rerun the export and overwrite the `_ll_h0` folders.
+| Folder | Stateful | Notes |
+|--------|----------|-------|
+| `dfn2` | No | Stateless DeepFilterNet2 |
+| `dfn2_ll` | No | Low-latency DeepFilterNet2 |
+| `dfn2_h0` | **Yes** | Stateful DeepFilterNet2 (GRU) |
+| `dfn3` | No | Stateless DeepFilterNet3 |
+| `dfn3_ll` | No | Low-latency DeepFilterNet3 |
+| `dfn3_h0` | **Yes** | Stateful DeepFilterNet3 (GRU) |
 
 ## Common questions
 
 **Q: How do I know if the model is stateful?**
-A: If the encoder has an input named `h0`, it is stateful. Rust checks this automatically.
+A: If the combined model has an input named `h0`, it is stateful. Rust checks this automatically.
 
 **Q: I exported but still get choppy audio.**
-A: Re?export from the exact checkpoint you want to match. If you changed model families
-(e.g. dfn2 -> dfn3), you must export again. Make sure you are using the new model folder
-in Rust.
+A: Re-export from the exact checkpoint you want to match. If you changed model families
+(e.g. dfn2 -> dfn3), you must export again. Make sure you are using the correct model folder.
 
 **Q: Where do the checkpoints come from?**
-A: DeepFilterNet caches them here (example for DFN3):
-`C:\Users\user\AppData\Local\DeepFilterNet\DeepFilterNet\Cache\DeepFilterNet3\checkpoints\model_120.ckpt.best`
+A: DeepFilterNet caches them automatically. Example path for DFN3 on Windows:
+`%LOCALAPPDATA%\DeepFilterNet\DeepFilterNet\Cache\DeepFilterNet3\checkpoints\model_120.ckpt.best`
 
-**Q: Do I need to edit Rust for each model?**
-A: No. Once a model is exported as stateful ONNX, Rust will detect `h0` and work.
+**Q: Can I export LL models as stateful?**
+A: The official DeepFilterNet package only ships checkpoints for standard (non-LL) models.
+LL models don't use GRU, so stateful export doesn't apply to them.
 
-## Notes / tips
+**Q: Do I need to edit Rust code for each model?**
+A: No. Once exported as stateful ONNX and merged, Rust detects `h0` and works automatically.
+
+## Notes
 
 - Always export from the same DeepFilterNet checkpoint you want to match.
-- For DeepFilterNet3, the cached checkpoint is typically:
-  `C:\Users\user\AppData\Local\DeepFilterNet\DeepFilterNet\Cache\DeepFilterNet3\checkpoints\model_120.ckpt.best`
-- If you switch model families or checkpoints, you must re?export the ONNX.
-- The export script uses CPU and should run in under a minute.
-
+- The export script uses CPU and runs in under a minute.
+- After exporting, always run `merge_onnx.py` to create `combined.onnx`.
