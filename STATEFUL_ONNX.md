@@ -34,9 +34,6 @@ python scripts/export_onnx_stateful.py --to models/dfn3_h0
 
 # Export from a specific checkpoint/model directory
 python scripts/export_onnx_stateful.py --from path/to/checkpoint_dir --to models/dfn3_h0
-
-# Optionally provide a 48kHz WAV for tracing (uses synthetic audio if omitted)
-python scripts/export_onnx_stateful.py --to models/dfn3_h0 --wav audio_48k.wav
 ```
 
 This produces in the target directory:

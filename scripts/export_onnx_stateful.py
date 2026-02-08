@@ -6,7 +6,6 @@ Install dependencies:
 Usage:
     python scripts/export_onnx_stateful.py --to models/dfn3_h0
     python scripts/export_onnx_stateful.py --from path/to/checkpoint_dir --to models/dfn3_h0
-    python scripts/export_onnx_stateful.py --to models/dfn3_h0 --wav audio_48k.wav
 
 After export, merge into combined.onnx:
     python scripts/merge_onnx.py models/dfn3_h0
@@ -15,29 +14,12 @@ After export, merge into combined.onnx:
 import argparse
 import os
 import shutil
-import wave
-import struct
 
 import torch
 import torch.nn.functional as F
 
 from df.enhance import init_df, df_features
 from df.model import ModelParams
-
-
-def read_wav_mono_16(path):
-    with wave.open(path, "rb") as w:
-        nchan = w.getnchannels()
-        nframes = w.getnframes()
-        sampwidth = w.getsampwidth()
-        data = w.readframes(nframes)
-    if sampwidth != 2:
-        raise RuntimeError("Only 16-bit PCM supported")
-    vals = struct.unpack("<{}h".format(nframes * nchan), data)
-    if nchan > 1:
-        vals = vals[::nchan]
-    audio = torch.tensor([v / 32768.0 for v in vals], dtype=torch.float32).unsqueeze(0)
-    return audio
 
 
 class EncoderWithState(torch.nn.Module):
@@ -75,10 +57,6 @@ def main():
         "--to", required=True,
         help="Output directory for enc.onnx, erb_dec.onnx, df_dec.onnx, config.ini"
     )
-    parser.add_argument(
-        "--wav", default=None,
-        help="48kHz 16-bit mono WAV for tracing (optional, uses synthetic audio if omitted)"
-    )
     args = parser.parse_args()
 
     export_dir = args.to
@@ -94,13 +72,8 @@ def main():
 
     p = ModelParams()
 
-    if args.wav:
-        print(f"Using audio: {args.wav}")
-        audio = read_wav_mono_16(args.wav)
-    else:
-        # Synthetic 1-second silence for tracing (no WAV file needed)
-        print("Using synthetic audio for tracing")
-        audio = torch.zeros(1, 48000)
+    # Synthetic silence is sufficient for ONNX tracing (shapes are the same for any audio)
+    audio = torch.zeros(1, 48000)
 
     audio = F.pad(audio, (0, df_state.fft_size()))
 
