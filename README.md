@@ -1,13 +1,13 @@
 # deepfilter-rt
 
-Real-time speech enhancement using DeepFilterNet with ONNX Runtime in Rust.
+Real-time speech enhancement using [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) with ONNX Runtime in Rust.
 
 ## Overview
 
-This crate provides frame-by-frame audio denoising using the [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) neural network. It combines:
+This crate provides frame-by-frame audio denoising using the DeepFilterNet neural network. It runs a single merged ONNX model per frame for minimal inference overhead, combining:
 
 - **df crate**: STFT/ISTFT and feature extraction (from DeepFilterNet)
-- **ort**: ONNX Runtime for neural network inference
+- **ort**: ONNX Runtime for neural network inference (CPU, CUDA, NNAPI, CoreML)
 
 ## Processing Pipeline
 
@@ -21,44 +21,43 @@ Audio Frame (480 samples @ 48kHz = 10ms)
 │     Output: 481 complex bins        │
 └─────────────────────────────────────┘
     │
-    ├──────────────────┬──────────────────┐
-    ▼                  ▼                  │
-┌──────────────┐  ┌──────────────┐        │
-│ 2. ERB Feat  │  │ 3. Spec Feat │        │
-│ 481→32 bands │  │ First 96 bins│        │
-│ dB + norm    │  │ Unit norm    │        │
-└──────────────┘  └──────────────┘        │
-    │                  │                  │
-    └────────┬─────────┘                  │
-             ▼                            │
-┌─────────────────────────────────────┐   │
-│  4. ENCODER (enc.onnx)              │   │
-│     → embeddings, skip connections  │   │
-└─────────────────────────────────────┘   │
-             │                            │
-    ┌────────┴────────┐                   │
-    ▼                 ▼                   │
-┌──────────────┐  ┌──────────────┐        │
-│ 5. ERB DEC   │  │ 6. DF DEC    │        │
-│ → mask [32]  │  │ → coefs [5,96,2]      │
-└──────────────┘  └──────────────┘        │
-    │                 │                   │
-    ▼                 ▼                   │
-┌──────────────┐  ┌──────────────┐        │
-│ 7. Apply Mask│  │ 8. Deep Filter│◄──────┘
-│ Expand→481   │  │ Convolve 5 taps│
+    ├──────────────────┐
+    ▼                  ▼
+┌──────────────┐  ┌──────────────┐
+│ 2. ERB Feat  │  │ 3. Spec Feat │
+│ 481→32 bands │  │ First 96 bins│
+│ dB + norm    │  │ Unit norm    │
 └──────────────┘  └──────────────┘
+    │                  │
+    └────────┬─────────┘
+             ▼
+┌─────────────────────────────────────┐
+│  4. COMBINED MODEL (combined.onnx)  │
+│     Single ONNX session:            │
+│     encoder + ERB decoder + DF dec  │
+│     → mask [32], coefs [5,96,2],    │
+│       lsnr [1]                      │
+└─────────────────────────────────────┘
+             │
+    ┌────────┴────────┐
+    ▼                 ▼
+┌──────────────┐  ┌───────────────┐
+│ 5. Apply Mask│  │ 6. Deep Filter│
+│ Expand→481   │  │ Convolve 5 taps│
+└──────────────┘  └───────────────┘
              │
              ▼
 ┌─────────────────────────────────────┐
-│  9. ISTFT Synthesis                 │
+│  7. ISTFT Synthesis                 │
 │     → Enhanced audio (480 samples)  │
 └─────────────────────────────────────┘
 ```
 
+The three original ONNX models (encoder, ERB decoder, DF decoder) are pre-merged into a single `combined.onnx` per variant. This reduces per-frame overhead from 3 ORT dispatches to 1.
+
 ## Model Variants
 
-All models downloaded from [DeepFilterNet releases](https://github.com/Rikorose/DeepFilterNet/tree/main/models).
+All models from [DeepFilterNet releases](https://github.com/Rikorose/DeepFilterNet/tree/main/models), pre-merged.
 
 | Model | Lookahead | Latency | Mode | Description |
 |-------|-----------|---------|------|-------------|
@@ -77,6 +76,18 @@ All models downloaded from [DeepFilterNet releases](https://github.com/Rikorose/
 - DF bins: 96
 - DF order: 5 taps
 
+## Installation
+
+```toml
+[dependencies]
+deepfilter-rt = { git = "https://github.com/shimondoodkin/deepfilter-rt" }
+```
+
+### Requirements
+
+- ONNX Runtime dynamic library (auto-downloaded by `ort` on desktop, or provide `libonnxruntime.so` for Android)
+- Model files: `combined.onnx` + `config.ini` per variant (included in `models/`)
+
 ## Usage
 
 ### Streaming API (Recommended)
@@ -85,7 +96,6 @@ All models downloaded from [DeepFilterNet releases](https://github.com/Rikorose/
 use deepfilter_rt::DeepFilterStream;
 use std::path::Path;
 
-// Load model (auto-detects variant from folder name + config.ini)
 let mut stream = DeepFilterStream::new(Path::new("models/dfn3_ll"))?;
 stream.warmup()?;  // Avoid cold-start latency
 
@@ -100,25 +110,52 @@ let remaining = stream.flush()?;
 
 ```rust
 use deepfilter_rt::{DeepFilterProcessor, HOP_SIZE};
+use std::path::Path;
 
-let mut processor = DeepFilterProcessor::new(Path::new("models/dfn2_ll"))?;
+let mut processor = DeepFilterProcessor::new(Path::new("models/dfn3_ll"))?;
+processor.warmup()?;
 
 // In your audio callback (must be exactly 480 samples)
-fn audio_callback(input: &[f32; 480], output: &mut [f32; 480]) {
-    processor.process_frame(input, output).unwrap();
-}
+let mut output = vec![0.0f32; HOP_SIZE];
+processor.process_frame(&input, &mut output)?;
 ```
+
+### Pipelined Threading
+
+For real-time apps where ONNX inference is too heavy for the audio callback thread, run the denoiser on a dedicated thread with a bounded channel:
+
+```rust
+use std::sync::mpsc;
+
+let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(500); // ~5s buffer at 10ms frames
+
+// DeepFilter thread
+std::thread::spawn(move || {
+    let mut proc = DeepFilterProcessor::new(Path::new("models/dfn3_ll")).unwrap();
+    proc.warmup().unwrap();
+    let mut out = vec![0.0f32; 480];
+    while let Ok(frame) = rx.recv() {
+        proc.process_frame(&frame, &mut out).unwrap();
+        // use denoised output...
+    }
+});
+
+// Audio thread - send frames without blocking on inference
+tx.send(audio_frame.to_vec()).ok();
+```
+
+See `examples/pipelined.rs` for a complete working example.
 
 ### Check Model Info
 
 ```rust
 let stream = DeepFilterStream::new(model_path)?;
 
-println!("Model: {}", stream.variant().name());           // "DeepFilterNet3-LL"
+println!("Model: {}", stream.variant().name());            // "DeepFilterNet3-LL"
 println!("Low latency: {}", stream.variant().is_low_latency()); // true
-println!("Stateful: {}", stream.variant().is_stateful()); // false
-println!("Latency: {}ms", stream.latency_ms());           // 10.0
-println!("Sample rate: {}", stream.sample_rate());        // 48000
+println!("Stateful: {}", stream.variant().is_stateful());  // false
+println!("Latency: {}ms", stream.latency_ms());            // 10.0
+println!("Sample rate: {}", stream.sample_rate());          // 48000
 ```
 
 ## Hardware Acceleration
@@ -127,30 +164,83 @@ Enable via Cargo features:
 
 ```toml
 [dependencies]
+# NVIDIA GPU (CUDA) — default
+deepfilter-rt = { git = "..." }
+
 # Android GPU/NPU (NNAPI)
-deepfilter-rt = { path = "...", features = ["nnapi"] }
+deepfilter-rt = { git = "...", features = ["nnapi"] }
 
 # Android with fp16 relaxation (faster, slightly lower quality)
-deepfilter-rt = { path = "...", features = ["nnapi", "fp16"] }
+deepfilter-rt = { git = "...", features = ["nnapi", "fp16"] }
 
 # iOS/macOS (CoreML)
-deepfilter-rt = { path = "...", features = ["coreml"] }
+deepfilter-rt = { git = "...", features = ["coreml"] }
 
-# NVIDIA GPU (CUDA)
-deepfilter-rt = { path = "...", features = ["cuda"] }
+# CPU only (no GPU features)
+deepfilter-rt = { git = "...", default-features = false }
 ```
 
 ### fp16 Pipeline
 
-With `fp16` enabled, the processing pipeline looks like:
+With `fp16` enabled:
 
 ```
-Audio (i16) → f32 → [STFT f32] → [NNAPI: f32→fp16→inference→fp16→f32] → [ISTFT f32] → f32
-                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                                  Only this part uses fp16 internally
+Audio → f32 → [STFT f32] → [NNAPI: f32→fp16→inference→fp16→f32] → [ISTFT f32] → f32
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                             Only this part uses fp16 internally
 ```
 
 The API remains f32 throughout. The fp16 benefit is faster matrix ops on NPU/GPU.
+
+## Examples
+
+```bash
+# Process a WAV file (high-level streaming API)
+cargo run --example process_file -- input.wav output.wav models/dfn3_ll
+
+# Simulated realtime streaming
+cargo run --example realtime -- input.wav output.wav models/dfn3_ll
+
+# Pipelined threading (producer/consumer pattern)
+cargo run --example pipelined -- input.wav output.wav models/dfn3_ll
+```
+
+## Merging Models
+
+Pre-merged `combined.onnx` files are included for all 6 variants. If you need to re-merge (e.g. after updating source models):
+
+```bash
+pip install onnx onnxsim
+
+# Merge a single variant
+python scripts/merge_onnx.py models/dfn3_ll
+
+# Merge all variants
+for dir in models/dfn2 models/dfn2_h0 models/dfn2_ll models/dfn3 models/dfn3_h0 models/dfn3_ll; do
+    python scripts/merge_onnx.py "$dir"
+done
+```
+
+The script merges `enc.onnx`, `erb_dec.onnx`, and `df_dec.onnx` into a single `combined.onnx` with proper tensor name prefixing to avoid ORT buffer collisions.
+
+## Performance
+
+Single merged model reduces per-frame ORT overhead from 3 dispatches to 1. Combined with flat ring buffers and pre-allocated I/O, the hot path has zero heap allocations.
+
+| Model | CPU | CUDA | Notes |
+|-------|-----|------|-------|
+| dfn2_ll | ~0.1-0.2x RTF | faster | Fast, good for embedded |
+| dfn3_ll | ~0.3-0.5x RTF | faster | Larger but better quality |
+
+RTF = Real-Time Factor (< 1.0 means faster than real-time).
+
+## Thread Count
+
+The `with_threads` constructors control ONNX Runtime's intra-op parallelism:
+
+- **Real-time audio**: Use 1-2 threads to minimize latency jitter
+- **Batch/offline**: Use more threads (4-8) for throughput
+- **Default**: 2 threads
 
 ## Android Setup
 
@@ -160,120 +250,46 @@ See `ONNX_RUNTIME_ANDROID_SETUP.md` for complete instructions:
 2. Place in `android/app/src/main/jniLibs/{arch}/`
 3. Build with: `cargo ndk -t arm64-v8a build --release --features "nnapi,fp16"`
 
-### Logging
-
-This crate uses the `log` crate. Configure `android_logger` once in your app:
-
-```rust
-android_logger::init_once(
-    android_logger::Config::default()
-        .with_max_level(log::LevelFilter::Debug)
-        .with_tag("MyApp"),
-);
-```
-
-View logs: `adb logcat | grep MyApp`
-
-## Installation
-
-```toml
-[dependencies]
-deepfilter-rt = { git = "https://github.com/shimondoodkin/deepfilter-rt" }
-```
-
-### Requirements
-
-- ONNX Runtime (automatically downloaded by `ort` crate, or provide `libonnxruntime.so` for Android)
-- Model files: `enc.onnx`, `erb_dec.onnx`, `df_dec.onnx`, `config.ini`
-
-### Download Models
-
-Models are included in `models/` directory:
-- `models/dfn2/` - DeepFilterNet2
-- `models/dfn2_ll/` - DeepFilterNet2 Low Latency
-- `models/dfn2_h0/` - DeepFilterNet2 Stateful
-- `models/dfn3/` - DeepFilterNet3
-- `models/dfn3_ll/` - DeepFilterNet3 Low Latency
-- `models/dfn3_h0/` - DeepFilterNet3 Stateful
-
-Or download manually:
-```bash
-curl -LO https://github.com/Rikorose/DeepFilterNet/raw/main/models/DeepFilterNet3_ll_onnx.tar.gz
-tar -xzf DeepFilterNet3_ll_onnx.tar.gz
-```
-
-## Examples
-
-```bash
-# Process a WAV file
-cargo run --example process_file -- input.wav output.wav models/dfn3_ll
-
-# Simulated realtime (streaming) from WAV to WAV
-cargo run --example realtime -- input.wav output.wav models/dfn3_ll
-```
-
-## Performance
-
-Target: Real-time factor (RTF) < 1.0
-
-| Model | CPU (typical) | Notes |
-|-------|---------------|-------|
-| dfn2_ll | ~0.1-0.2x | Fast, good for embedded |
-| dfn3_ll | ~0.3-0.5x | Larger but better quality |
-
 ## API Reference
 
 ### `DeepFilterStream`
 
-High-level streaming wrapper with buffering.
+High-level streaming wrapper with internal buffering.
 
-- `new(model_dir: &Path)` - Load from directory (auto-detect variant)
-- `with_threads(model_dir, threads)` - With explicit thread count
-- `process(&mut self, input: &[f32]) -> Vec<f32>` - Process any chunk size
-- `flush(&mut self) -> Vec<f32>` - Get remaining samples
-- `warmup(&mut self)` - Warm up inference engine
-- `reset(&mut self)` - Reset state
-- `latency_ms(&self) -> f32` - Get total latency
-- `sample_rate(&self) -> usize` - Always 48000
-- `variant(&self) -> ModelVariant` - Get model type
+| Method | Description |
+|--------|-------------|
+| `new(model_dir)` | Load from directory (auto-detect variant) |
+| `with_threads(model_dir, n)` | With explicit thread count |
+| `process(input) -> Vec<f32>` | Process any chunk size |
+| `flush() -> Vec<f32>` | Get remaining samples at end of stream |
+| `warmup()` | Warm up inference engine |
+| `reset()` | Reset state between streams |
+| `latency_ms() -> f32` | Total algorithmic latency |
+| `sample_rate() -> usize` | Always 48000 |
+| `variant() -> ModelVariant` | Get model type |
 
 ### `DeepFilterProcessor`
 
-Low-level frame processor (for audio callbacks).
+Low-level frame processor for audio callbacks.
 
-- `new(model_dir: &Path)` - Load from directory
-- `with_threads(model_dir, threads)` - With explicit thread count
-- `process_frame(&mut self, input: &[f32], output: &mut [f32])` - Process one 480-sample frame
-- `warmup(&mut self)` - Warm up inference engine
-- `reset(&mut self)` - Reset all states
-- `variant(&self) -> ModelVariant` - Get model type
+| Method | Description |
+|--------|-------------|
+| `new(model_dir)` | Load from directory |
+| `with_threads(model_dir, n)` | With explicit thread count |
+| `process_frame(input, output)` | Process one 480-sample frame |
+| `warmup()` | Warm up inference engine |
+| `reset()` | Reset all states |
+| `variant() -> ModelVariant` | Get model type |
 
 ### `ModelVariant`
 
-```rust
-pub enum ModelVariant {
-    DeepFilterNet2,
-    DeepFilterNet2LL,
-    DeepFilterNet2H0,
-    DeepFilterNet3,
-    DeepFilterNet3LL,
-    DeepFilterNet3H0,
-}
+Auto-detected from folder name and `config.ini`.
 
-impl ModelVariant {
-    fn name(&self) -> &'static str;
-    fn is_low_latency(&self) -> bool;
-    fn is_stateful(&self) -> bool;
-}
-```
-
-## Thread Count
-
-The `with_threads` constructors control ONNX Runtime's intra-op parallelism:
-
-- **Real-time audio**: Use 1-2 threads to minimize latency jitter
-- **Batch/offline**: Use more threads (4-8) for throughput
-- **Default**: ONNX Runtime picks based on CPU cores
+| Method | Description |
+|--------|-------------|
+| `name() -> &str` | e.g. "DeepFilterNet3-LL" |
+| `is_low_latency() -> bool` | 10ms vs 30ms |
+| `is_stateful() -> bool` | Has GRU hidden state |
 
 ## More Docs
 
