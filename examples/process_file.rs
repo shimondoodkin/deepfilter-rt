@@ -18,11 +18,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Path::new(&args[3]).to_path_buf()
     } else {
         // Default to models/dfn3 relative to crate root
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("models/dfn3")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("models/dfn3_ll")
     };
 
     // Create processor
-    println!("Loading models from {:?}...", model_dir);
+    println!("Loading model from {:?}...", model_dir);
     let mut stream = DeepFilterStream::new(&model_dir)?;
     let variant = stream.variant();
     println!("Using model variant: {}", variant.name());

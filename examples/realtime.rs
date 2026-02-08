@@ -17,11 +17,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_dir = if args.len() > 3 {
         Path::new(&args[3]).to_path_buf()
     } else {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("models/dfn3")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("models/dfn3_ll")
     };
 
-    println!("Loading models from {:?}...", model_dir);
+    println!("Loading model from {:?}...", model_dir);
     let mut processor = DeepFilterProcessor::new(&model_dir)?;
+    processor.warmup()?;
     let variant = processor.variant();
     println!("Using model variant: {}", variant.name());
     println!("Inference mode: {}", if variant.is_stateful() { "stateful (h0)" } else { "stateless" });
