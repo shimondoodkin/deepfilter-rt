@@ -210,7 +210,7 @@ cargo run --example pipelined -- input.wav output.wav models/dfn3_ll
 Pre-merged `combined.onnx` files are included for all 6 variants. If you need to re-merge (e.g. after updating source models):
 
 ```bash
-pip install onnx onnxsim
+pip install -r scripts/requirements.txt
 
 # Merge a single variant
 python scripts/merge_onnx.py models/dfn3_ll
@@ -221,7 +221,15 @@ for dir in models/dfn2 models/dfn2_h0 models/dfn2_ll models/dfn3 models/dfn3_h0 
 done
 ```
 
-The script merges `enc.onnx`, `erb_dec.onnx`, and `df_dec.onnx` into a single `combined.onnx` with proper tensor name prefixing to avoid ORT buffer collisions.
+If `onnxsim` fails to install (common on Python 3.12+ / Windows where no prebuilt wheel exists), use the included builder:
+
+```bash
+python scripts/build_onnxsim.py
+```
+
+It checks prerequisites (Git, CMake, MSVC), clones the onnxsim repo, and builds a wheel from source.
+
+The merge script merges `enc.onnx`, `erb_dec.onnx`, and `df_dec.onnx` into a single `combined.onnx` with proper tensor name prefixing to avoid ORT buffer collisions.
 
 ## Performance
 

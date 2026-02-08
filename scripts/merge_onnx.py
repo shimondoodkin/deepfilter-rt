@@ -1,5 +1,11 @@
 """Merge 3 DeepFilter ONNX models (enc, erb_dec, df_dec) into a single model.
 
+Install dependencies:
+    pip install onnx onnxsim
+
+If onnxsim fails to install (e.g. on Python 3.12+/Windows), run:
+    python scripts/build_onnxsim.py
+
 Usage:
     python scripts/merge_onnx.py [model_dir]
 
