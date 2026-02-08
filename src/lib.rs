@@ -116,7 +116,6 @@
 //! for parallel processing - they do not share state.
 
 use deep_filter::DFState;
-use ndarray::Array3;
 use num_complex::Complex32;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
@@ -307,17 +306,18 @@ fn parse_ini(content: &str) -> HashMap<String, String> {
 
 /// Real-time DeepFilterNet processor
 pub struct DeepFilterProcessor {
-    encoder: Session,
-    erb_decoder: Session,
-    df_decoder: Session,
+    session: Session,
     df_state: DFState,
     rolling_spec_buf_x: VecDeque<Vec<Complex32>>, // noisy spec
     rolling_spec_buf_y: VecDeque<Vec<Complex32>>, // stage-1 enhanced spec
     erb_feat_buf: VecDeque<Vec<f32>>,
     spec_feat_buf: VecDeque<Vec<Complex32>>,
-    enc_feat_buf_erb: VecDeque<Vec<f32>>,
-    enc_feat_buf_spec: VecDeque<Vec<Complex32>>,
-    frames_processed: usize, // Track frames to know when buffer has valid data
+    // Flat ring buffers for encoder temporal context (avoid VecDeque<Vec<>> clones)
+    enc_erb_ring: Vec<f32>,      // [enc_window * NB_ERB], ring buffer
+    enc_spec_ring: Vec<f32>,     // [enc_window * NB_DF * 2], ring buffer (re/im interleaved)
+    enc_ring_pos: usize,         // write position in ring (0..enc_window-1)
+    enc_ring_count: usize,       // frames written so far (saturates at enc_window)
+    frames_processed: usize,
     lookahead: usize,
     enc_h: Vec<f32>,
     enc_hidden_dim: usize,
@@ -325,7 +325,18 @@ pub struct DeepFilterProcessor {
     inference_mode: InferenceMode,
     norm_alpha: f32,
     variant: ModelVariant,
-    debug_dump_frame: Option<usize>,
+    // Pre-allocated per-frame work buffers (avoid heap allocation per frame)
+    work_spec: Vec<Complex32>,
+    work_erb_feat: Vec<f32>,
+    work_spec_feat_input: Vec<Complex32>,
+    work_spec_feat_cplx: Vec<Complex32>,
+    work_out_spec: Vec<Complex32>,
+    work_zeros: Vec<f32>,
+    // Pre-allocated inference I/O buffers
+    inf_erb_data: Vec<f32>,      // [enc_window * NB_ERB]
+    inf_spec_data: Vec<f32>,     // [2 * enc_window * NB_DF]
+    inf_mask: Vec<f32>,          // [NB_ERB]
+    inf_df_coefs: Vec<f32>,      // [NB_DF * DF_ORDER * 2]
 }
 
 impl DeepFilterProcessor {
@@ -338,7 +349,7 @@ impl DeepFilterProcessor {
     /// - config.ini (for variant detection)
     pub fn new(model_dir: &Path) -> Result<Self> {
         let variant = ModelVariant::from_model_dir(model_dir).unwrap_or(ModelVariant::DeepFilterNet3);
-        Self::with_variant_and_threads(model_dir, variant, None)
+        Self::with_variant_and_threads(model_dir, variant, Some(2))
     }
 
     /// Create processor with explicit thread count.
@@ -471,10 +482,15 @@ impl DeepFilterProcessor {
             Ok(builder.commit_from_file(path)?)
         };
 
-        let encoder = build_session(model_dir.join("enc.onnx"))?;
-        let erb_decoder = build_session(model_dir.join("erb_dec.onnx"))?;
-        let df_decoder = build_session(model_dir.join("df_dec.onnx"))?;
-        let has_h0 = encoder.inputs().iter().any(|i| i.name() == "h0");
+        let combined_path = model_dir.join("combined.onnx");
+        let session = if combined_path.exists() {
+            build_session(combined_path)?
+        } else {
+            return Err(DfError::Config(
+                "combined.onnx not found. Run: python scripts/merge_onnx.py".to_string(),
+            ));
+        };
+        let has_h0 = session.inputs().iter().any(|i| i.name() == "h0");
         if inference_mode == InferenceMode::StatefulH0 && !has_h0 {
             return Err(DfError::Config(
                 "Model directory ends with _h0 but encoder has no h0 input".to_string(),
@@ -499,25 +515,26 @@ impl DeepFilterProcessor {
         }
         let erb_feat_buf = VecDeque::with_capacity(lookahead + 1);
         let spec_feat_buf = VecDeque::with_capacity(lookahead + 1);
-        let enc_feat_buf_erb = VecDeque::with_capacity(enc_window);
-        let enc_feat_buf_spec = VecDeque::with_capacity(enc_window);
+        // Pre-filled flat ring buffers (zeros = silent frames for padding)
+        let enc_erb_ring = vec![0.0f32; enc_window * NB_ERB];
+        let enc_spec_ring = vec![0.0f32; enc_window * NB_DF * 2];
+        // Start at position enc_window-1 so next write goes to slot 0 (wrapping),
+        // and count = enc_window-1 means first real frame brings us to enc_window
+        let enc_ring_pos = enc_window.saturating_sub(1);
+        let enc_ring_count = enc_window.saturating_sub(1);
         let enc_h = vec![0.0f32; enc_hidden_dim];
 
-        let debug_dump_frame = std::env::var("DF_DEBUG_DUMP_FRAME")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok());
-
         Ok(Self {
-            encoder,
-            erb_decoder,
-            df_decoder,
+            session,
             df_state,
             rolling_spec_buf_x,
             rolling_spec_buf_y,
             erb_feat_buf,
             spec_feat_buf,
-            enc_feat_buf_erb,
-            enc_feat_buf_spec,
+            enc_erb_ring,
+            enc_spec_ring,
+            enc_ring_pos,
+            enc_ring_count,
             frames_processed: 0,
             lookahead,
             enc_h,
@@ -526,7 +543,16 @@ impl DeepFilterProcessor {
             inference_mode,
             norm_alpha,
             variant,
-            debug_dump_frame,
+            work_spec: vec![Complex32::new(0.0, 0.0); FREQ_SIZE],
+            work_erb_feat: vec![0.0f32; NB_ERB],
+            work_spec_feat_input: vec![Complex32::new(0.0, 0.0); NB_DF],
+            work_spec_feat_cplx: vec![Complex32::new(0.0, 0.0); NB_DF],
+            work_out_spec: vec![Complex32::new(0.0, 0.0); FREQ_SIZE],
+            work_zeros: vec![0.0f32; NB_ERB],
+            inf_erb_data: vec![0.0f32; enc_window * NB_ERB],
+            inf_spec_data: vec![0.0f32; 2 * enc_window * NB_DF],
+            inf_mask: vec![0.0f32; NB_ERB],
+            inf_df_coefs: vec![0.0f32; NB_DF * DF_ORDER * 2],
         })
     }
 
@@ -552,8 +578,10 @@ impl DeepFilterProcessor {
         }
         self.erb_feat_buf.clear();
         self.spec_feat_buf.clear();
-        self.enc_feat_buf_erb.clear();
-        self.enc_feat_buf_spec.clear();
+        self.enc_erb_ring.fill(0.0);
+        self.enc_spec_ring.fill(0.0);
+        self.enc_ring_pos = self.enc_window.saturating_sub(1);
+        self.enc_ring_count = self.enc_window.saturating_sub(1);
         self.enc_h.fill(0.0);
     }
 
@@ -581,71 +609,71 @@ impl DeepFilterProcessor {
         debug_assert_eq!(input.len(), HOP_SIZE);
         debug_assert_eq!(output.len(), HOP_SIZE);
 
-        // 1. STFT
-        let mut spec = vec![Complex32::new(0.0, 0.0); FREQ_SIZE];
-        self.df_state.analysis(input, &mut spec);
+        // 1. STFT (reuse preallocated buffer)
+        for v in self.work_spec.iter_mut() { *v = Complex32::new(0.0, 0.0); }
+        self.df_state.analysis(input, &mut self.work_spec);
 
         // 2. Store ORIGINAL spectrum in rolling buffers BEFORE any processing (for DF)
         self.rolling_spec_buf_x.pop_front();
-        self.rolling_spec_buf_x.push_back(spec.clone());
+        self.rolling_spec_buf_x.push_back(self.work_spec.clone());
         self.rolling_spec_buf_y.pop_front();
-        self.rolling_spec_buf_y.push_back(spec.clone());
+        self.rolling_spec_buf_y.push_back(self.work_spec.clone());
 
-        // 3. ERB features
-        let mut erb_feat = vec![0.0f32; NB_ERB];
-        self.df_state.feat_erb(&spec, self.norm_alpha, &mut erb_feat);
+        // 3. ERB features (reuse preallocated buffer)
+        self.work_erb_feat.fill(0.0);
+        self.df_state.feat_erb(&self.work_spec, self.norm_alpha, &mut self.work_erb_feat);
 
-        // 4. Spec features - use separate input/output buffers
-        let spec_feat_input: Vec<Complex32> = spec[..NB_DF].to_vec();
-        let mut spec_feat_cplx = vec![Complex32::new(0.0, 0.0); NB_DF];
+        // 4. Spec features - use preallocated buffers
+        self.work_spec_feat_input.copy_from_slice(&self.work_spec[..NB_DF]);
+        for v in self.work_spec_feat_cplx.iter_mut() { *v = Complex32::new(0.0, 0.0); }
         self.df_state
-            .feat_cplx(&spec_feat_input, self.norm_alpha, &mut spec_feat_cplx);
+            .feat_cplx(&self.work_spec_feat_input, self.norm_alpha, &mut self.work_spec_feat_cplx);
 
         // 5. Buffer features for lookahead alignment (pad_feat behavior)
-        self.erb_feat_buf.push_back(erb_feat.clone());
-        self.spec_feat_buf.push_back(spec_feat_cplx.clone());
+        self.erb_feat_buf.push_back(self.work_erb_feat.clone());
+        self.spec_feat_buf.push_back(self.work_spec_feat_cplx.clone());
         if self.erb_feat_buf.len() <= self.lookahead {
-            // Not enough lookahead frames yet
             self.frames_processed = self.frames_processed.saturating_add(1);
-            let mut out_spec = vec![Complex32::new(0.0, 0.0); FREQ_SIZE];
-            self.df_state.synthesis(&mut out_spec, output);
+            for v in self.work_out_spec.iter_mut() { *v = Complex32::new(0.0, 0.0); }
+            self.df_state.synthesis(&mut self.work_out_spec, output);
             return Ok(());
         }
-        // Use lookahead frame for encoder input and build temporal context
-        let inf_erb = self.erb_feat_buf[self.lookahead].clone();
-        let inf_spec = self.spec_feat_buf[self.lookahead].clone();
-        // Shift buffer: remove oldest once consumed for lookahead
+
+        // Write lookahead frame into ring buffer (no Vec clone — direct copy)
+        let ring_slot = self.enc_ring_pos % self.enc_window;
+        let erb_off = ring_slot * NB_ERB;
+        self.enc_erb_ring[erb_off..erb_off + NB_ERB]
+            .copy_from_slice(&self.erb_feat_buf[self.lookahead]);
+        let spec_off = ring_slot * NB_DF * 2;
+        for (fi, c) in self.spec_feat_buf[self.lookahead].iter().enumerate() {
+            self.enc_spec_ring[spec_off + fi * 2] = c.re;
+            self.enc_spec_ring[spec_off + fi * 2 + 1] = c.im;
+        }
+        self.enc_ring_pos = self.enc_ring_pos.wrapping_add(1);
+        self.enc_ring_count = self.enc_ring_count.saturating_add(1).min(self.enc_window);
+
+        // Shift lookahead buffer
         if self.erb_feat_buf.len() > self.lookahead + 1 {
             self.erb_feat_buf.pop_front();
         }
         if self.spec_feat_buf.len() > self.lookahead + 1 {
             self.spec_feat_buf.pop_front();
         }
-        self.enc_feat_buf_erb.push_back(inf_erb);
-        self.enc_feat_buf_spec.push_back(inf_spec);
+
         let min_required = self.inference_mode.min_required_frames(self.lookahead);
-        if self.enc_feat_buf_erb.len() < min_required {
-            // Not enough temporal context yet
+        if self.enc_ring_count < min_required {
             self.frames_processed = self.frames_processed.saturating_add(1);
-            let mut out_spec = vec![Complex32::new(0.0, 0.0); FREQ_SIZE];
-            self.df_state.synthesis(&mut out_spec, output);
+            for v in self.work_out_spec.iter_mut() { *v = Complex32::new(0.0, 0.0); }
+            self.df_state.synthesis(&mut self.work_out_spec, output);
             return Ok(());
         }
-        if self.enc_feat_buf_erb.len() > self.enc_window {
-            self.enc_feat_buf_erb.pop_front();
-            self.enc_feat_buf_spec.pop_front();
-        }
-        let enc_erb_seq: Vec<Vec<f32>> = self.enc_feat_buf_erb.iter().cloned().collect();
-        let enc_spec_seq: Vec<Vec<Complex32>> = self.enc_feat_buf_spec.iter().cloned().collect();
-        let take_idx = enc_erb_seq.len().saturating_sub(1);
-        let (mask, df_coefs, lsnr) =
-            self.run_inference_seq(&enc_erb_seq, &enc_spec_seq, take_idx)?;
 
-        if let Some(target) = self.debug_dump_frame {
-            if self.frames_processed == target {
-                self.dump_debug_frame(target, &erb_feat, &spec_feat_cplx, &mask, &df_coefs)?;
-            }
-        }
+        // Build inference tensors from ring buffer (oldest-first order)
+        let t = self.enc_ring_count;
+        let oldest = self.enc_ring_pos.wrapping_sub(t) % self.enc_window;
+        self.fill_inference_tensors(t, oldest);
+
+        let lsnr = self.run_inference(t)?;
 
         // 6. Apply ERB mask to the centered frame in the rolling buffer (df_order - 1)
         let apply_mask = lsnr <= MAX_DB_ERB_THRESH;
@@ -653,273 +681,132 @@ impl DeepFilterProcessor {
         if let Some(center_spec) = self.rolling_spec_buf_y.get_mut(DF_ORDER - 1) {
             if apply_mask {
                 if apply_zero_mask {
-                    let zeros = vec![0.0f32; NB_ERB];
-                    self.df_state.apply_mask(center_spec, &zeros);
+                    self.df_state.apply_mask(center_spec, &self.work_zeros);
                 } else {
-                    self.df_state.apply_mask(center_spec, &mask);
+                    self.df_state.apply_mask(center_spec, &self.inf_mask);
                 }
             }
         }
 
-        // 7. Output the centered frame (implicit lookahead via rolling buffer)
+        // 7. Output the centered frame
         self.frames_processed = self.frames_processed.saturating_add(1);
-        let mut out_spec = self
-            .rolling_spec_buf_y
-            .get(DF_ORDER - 1)
-            .cloned()
-            .unwrap_or_else(|| vec![Complex32::new(0.0, 0.0); FREQ_SIZE]);
+        if let Some(src) = self.rolling_spec_buf_y.get(DF_ORDER - 1) {
+            self.work_out_spec.copy_from_slice(src);
+        } else {
+            for v in self.work_out_spec.iter_mut() { *v = Complex32::new(0.0, 0.0); }
+        }
 
         let apply_df = lsnr <= MAX_DB_DF_THRESH && !apply_zero_mask;
         if apply_df && self.rolling_spec_buf_x.len() >= DF_ORDER {
-            self.apply_deep_filter(&mut out_spec, &df_coefs);
+            Self::apply_deep_filter_flat(&mut self.work_out_spec, &self.rolling_spec_buf_x, &self.inf_df_coefs);
         }
 
         // 8. ISTFT
-        self.df_state.synthesis(&mut out_spec, output);
+        self.df_state.synthesis(&mut self.work_out_spec, output);
 
         Ok(())
     }
 
-    fn run_inference_seq(
-        &mut self,
-        erb_feat_seq: &[Vec<f32>],
-        spec_feat_seq: &[Vec<Complex32>],
-        take_idx: usize,
-    ) -> Result<(Vec<f32>, Array3<f32>, f32)> {
-        let t = erb_feat_seq.len();
-        debug_assert_eq!(t, spec_feat_seq.len());
-        // ERB tensor: [1, 1, T, 32]
-        let mut erb_data = vec![0.0f32; t * NB_ERB];
-        for (ti, frame) in erb_feat_seq.iter().enumerate() {
-            let base = ti * NB_ERB;
-            erb_data[base..base + NB_ERB].copy_from_slice(frame);
+    /// Fill pre-allocated inference tensor buffers from the ring buffer in oldest-first order.
+    fn fill_inference_tensors(&mut self, t: usize, oldest_slot: usize) {
+        // ERB tensor data: [1, 1, T, NB_ERB] flattened
+        for ti in 0..t {
+            let slot = (oldest_slot + ti) % self.enc_window;
+            let src_off = slot * NB_ERB;
+            let dst_off = ti * NB_ERB;
+            self.inf_erb_data[dst_off..dst_off + NB_ERB]
+                .copy_from_slice(&self.enc_erb_ring[src_off..src_off + NB_ERB]);
         }
-        let erb_tensor = Tensor::from_array(([1usize, 1, t, NB_ERB], erb_data))?;
 
-        // Spec tensor: [1, 2, T, 96] - channels = [real, imag]
-        let mut spec_data = vec![0.0f32; 2 * t * NB_DF];
-        // channel 0: real
-        for (ti, frame) in spec_feat_seq.iter().enumerate() {
-            let base = ti * NB_DF;
-            for (fi, c) in frame.iter().enumerate() {
-                spec_data[base + fi] = c.re;
-            }
-        }
-        // channel 1: imag
+        // Spec tensor data: [1, 2, T, NB_DF] = [real channel, imag channel]
+        // Ring stores interleaved re/im per freq, we need planar layout
         let ch1_offset = t * NB_DF;
-        for (ti, frame) in spec_feat_seq.iter().enumerate() {
-            let base = ch1_offset + ti * NB_DF;
-            for (fi, c) in frame.iter().enumerate() {
-                spec_data[base + fi] = c.im;
+        for ti in 0..t {
+            let slot = (oldest_slot + ti) % self.enc_window;
+            let src_off = slot * NB_DF * 2;
+            let re_off = ti * NB_DF;
+            let im_off = ch1_offset + ti * NB_DF;
+            for fi in 0..NB_DF {
+                self.inf_spec_data[re_off + fi] = self.enc_spec_ring[src_off + fi * 2];
+                self.inf_spec_data[im_off + fi] = self.enc_spec_ring[src_off + fi * 2 + 1];
             }
         }
-        let spec_tensor = Tensor::from_array(([1usize, 2, t, NB_DF], spec_data))?;
+    }
 
-        // Encoder (optionally stateful)
-        let enc_outputs = if self.inference_mode == InferenceMode::StatefulH0 {
+    /// Run inference using pre-filled inf_erb_data/inf_spec_data buffers.
+    /// Writes results into inf_mask and inf_df_coefs. Returns lsnr.
+    fn run_inference(&mut self, t: usize) -> Result<f32> {
+        let take_idx = t.saturating_sub(1);
+        let erb_len = t * NB_ERB;
+        let spec_len = 2 * t * NB_DF;
+
+        // Create tensors from pre-allocated data (ORT takes ownership of the Vec)
+        let erb_tensor = Tensor::from_array(([1usize, 1, t, NB_ERB], self.inf_erb_data[..erb_len].to_vec()))?;
+        let spec_tensor = Tensor::from_array(([1usize, 2, t, NB_DF], self.inf_spec_data[..spec_len].to_vec()))?;
+
+        let outputs = if self.inference_mode == InferenceMode::StatefulH0 {
             let h0_tensor = Tensor::from_array(([1usize, 1, self.enc_hidden_dim], self.enc_h.clone()))?;
-            self.encoder.run(ort::inputs![
+            self.session.run(ort::inputs![
                 "feat_erb" => erb_tensor,
                 "feat_spec" => spec_tensor,
                 "h0" => h0_tensor,
             ])?
         } else {
-            self.encoder.run(ort::inputs![
+            self.session.run(ort::inputs![
                 "feat_erb" => erb_tensor,
                 "feat_spec" => spec_tensor,
             ])?
         };
-        // Extract encoder outputs as (shape, data) tuples
-        let (e0_shape, e0_data) = enc_outputs["e0"].try_extract_tensor::<f32>()?;
-        let (e1_shape, e1_data) = enc_outputs["e1"].try_extract_tensor::<f32>()?;
-        let (e2_shape, e2_data) = enc_outputs["e2"].try_extract_tensor::<f32>()?;
-        let (e3_shape, e3_data) = enc_outputs["e3"].try_extract_tensor::<f32>()?;
-        let (emb_shape, emb_data) = enc_outputs["emb"].try_extract_tensor::<f32>()?;
-        let (c0_shape, c0_data) = enc_outputs["c0"].try_extract_tensor::<f32>()?;
-        let (_lsnr_shape, lsnr_data) = enc_outputs["lsnr"].try_extract_tensor::<f32>()?;
 
-        let e0_vec = e0_data.to_vec();
-        let e1_vec = e1_data.to_vec();
-        let e2_vec = e2_data.to_vec();
-        let e3_vec = e3_data.to_vec();
-        let emb_vec: Vec<f32> = emb_data.to_vec();
-        let c0_vec: Vec<f32> = c0_data.to_vec();
-        let lsnr_vec: Vec<f32> = lsnr_data.to_vec();
-        let lsnr = lsnr_vec.get(take_idx).copied().unwrap_or(0.0);
+        // Extract lsnr — read view directly, no .to_vec()
+        let (_lsnr_shape, lsnr_data) = outputs["lsnr"].try_extract_tensor::<f32>()?;
+        let lsnr = lsnr_data.get(take_idx).copied().unwrap_or(0.0);
+
+        // Extract h1 for stateful models
         if self.inference_mode == InferenceMode::StatefulH0 {
-            let (_h1_shape, h1_data) = enc_outputs["h1"].try_extract_tensor::<f32>()?;
-            let h1_vec = h1_data.to_vec();
-            if h1_vec.len() >= self.enc_hidden_dim {
-                self.enc_h.copy_from_slice(&h1_vec[..self.enc_hidden_dim]);
+            let (_h1_shape, h1_data) = outputs["h1"].try_extract_tensor::<f32>()?;
+            if h1_data.len() >= self.enc_hidden_dim {
+                self.enc_h.copy_from_slice(&h1_data[..self.enc_hidden_dim]);
             }
         }
 
-        // Helper to convert shape from [i64] to Vec<usize>
-        let to_shape = |s: &ort::tensor::Shape| -> Vec<usize> {
-            s.iter().map(|&d| d as usize).collect()
-        };
-
-        // Convert to tensors for ERB decoder
-        let e0_tensor = Tensor::from_array((to_shape(e0_shape), e0_data.to_vec()))?;
-        let e1_tensor = Tensor::from_array((to_shape(e1_shape), e1_data.to_vec()))?;
-        let e2_tensor = Tensor::from_array((to_shape(e2_shape), e2_data.to_vec()))?;
-        let e3_tensor = Tensor::from_array((to_shape(e3_shape), e3_data.to_vec()))?;
-        let e0_shape_vec = to_shape(e0_shape);
-        let e1_shape_vec = to_shape(e1_shape);
-        let e2_shape_vec = to_shape(e2_shape);
-        let e3_shape_vec = to_shape(e3_shape);
-        let emb_shape_vec = to_shape(emb_shape);
-        let c0_shape_vec = to_shape(c0_shape);
-        let emb_tensor = Tensor::from_array((emb_shape_vec.clone(), emb_vec.clone()))?;
-        let c0_tensor = Tensor::from_array((c0_shape_vec.clone(), c0_vec.clone()))?;
-
-        // Drop outputs to release mutable borrow before debug dumping
-        drop(enc_outputs);
-
-        if let Some(target) = self.debug_dump_frame {
-            if self.frames_processed == target {
-                self.dump_debug_tensor("enc_e0", target, e0_shape_vec, &e0_vec)?;
-                self.dump_debug_tensor("enc_e1", target, e1_shape_vec, &e1_vec)?;
-                self.dump_debug_tensor("enc_e2", target, e2_shape_vec, &e2_vec)?;
-                self.dump_debug_tensor("enc_e3", target, e3_shape_vec, &e3_vec)?;
-                self.dump_debug_tensor("enc_emb", target, emb_shape_vec.clone(), &emb_vec)?;
-                self.dump_debug_tensor("enc_c0", target, c0_shape_vec, &c0_vec)?;
-                self.dump_debug_tensor("enc_lsnr", target, vec![1], &lsnr_vec)?;
-            }
-        }
-
-        // ERB decoder
-        let erb_dec_outputs = self.erb_decoder.run(ort::inputs![
-            "emb" => emb_tensor,
-            "e3" => e3_tensor,
-            "e2" => e2_tensor,
-            "e1" => e1_tensor,
-            "e0" => e0_tensor,
-        ])?;
-        let (mask_shape, mask_data) = erb_dec_outputs["m"].try_extract_tensor::<f32>()?;
-        let mask_flat: Vec<f32> = mask_data.to_vec();
-        // mask shape: [1,1,T,NB_ERB]
+        // Extract mask — copy directly into pre-allocated buffer
+        let (mask_shape, mask_data) = outputs["m"].try_extract_tensor::<f32>()?;
         let mask_t = mask_shape[2] as usize;
         let mask_offset = take_idx.min(mask_t.saturating_sub(1)) * NB_ERB;
-        let mask: Vec<f32> = mask_flat[mask_offset..mask_offset + NB_ERB].to_vec();
+        self.inf_mask.copy_from_slice(&mask_data[mask_offset..mask_offset + NB_ERB]);
 
-        // DF decoder - need fresh tensors
-        let emb_tensor2 = Tensor::from_array((emb_shape_vec, emb_vec))?;
-        let df_dec_outputs = self.df_decoder.run(ort::inputs![
-            "emb" => emb_tensor2,
-            "c0" => c0_tensor,
-        ])?;
-
-        let (coefs_shape, coefs_data) = df_dec_outputs["coefs"].try_extract_tensor::<f32>()?;
-        let coefs_flat: Vec<f32> = coefs_data.to_vec();
+        // Extract DF coefs — copy directly into pre-allocated buffer
+        let (coefs_shape, coefs_data) = outputs["coefs"].try_extract_tensor::<f32>()?;
         let coefs_t = coefs_shape[1] as usize;
         let coefs_frame_size = NB_DF * DF_ORDER * 2;
         let coefs_offset = take_idx.min(coefs_t.saturating_sub(1)) * coefs_frame_size;
-        let coefs_slice = &coefs_flat[coefs_offset..coefs_offset + coefs_frame_size];
-        // Model outputs shape [1, 1, 96, 10] = [batch, time, nb_df, df_order*2]
-        // Reshape to [nb_df, df_order, 2] for our indexing
-        let df_coefs = Array3::from_shape_vec(
-            (NB_DF, DF_ORDER, 2),
-            Self::reshape_df_coefs(coefs_slice),
-        )?;
+        self.inf_df_coefs.copy_from_slice(&coefs_data[coefs_offset..coefs_offset + coefs_frame_size]);
 
-        Ok((mask, df_coefs, lsnr))
+        Ok(lsnr)
     }
 
-    fn reshape_df_coefs(coefs: &[f32]) -> Vec<f32> {
-        // Input layout: [1, 1, 96, 10] flattened = [freq][order*2]
-        // where for each freq: [re0, im0, re1, im1, re2, im2, re3, im3, re4, im4]
-        // Output layout: [nb_df, df_order, 2] = [freq][order][re/im]
-        coefs.to_vec()
-    }
-
-    fn dump_debug_frame(
-        &self,
-        frame_idx: usize,
-        erb_feat: &[f32],
-        spec_feat: &[Complex32],
-        mask: &[f32],
-        df_coefs: &Array3<f32>,
-    ) -> Result<()> {
-        let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("debug_dump");
-        std::fs::create_dir_all(&out_dir)?;
-
-        let write_f32 = |name: &str, data: &[f32]| -> Result<()> {
-            let path = out_dir.join(format!("{}_frame_{}.txt", name, frame_idx));
-            let mut s = String::new();
-            for (i, v) in data.iter().enumerate() {
-                s.push_str(&format!("{},{}\n", i, v));
-            }
-            std::fs::write(path, s)?;
-            Ok(())
-        };
-
-        let write_cplx = |name: &str, data: &[Complex32]| -> Result<()> {
-            let path = out_dir.join(format!("{}_frame_{}.txt", name, frame_idx));
-            let mut s = String::new();
-            for (i, v) in data.iter().enumerate() {
-                s.push_str(&format!("{},{},{}\n", i, v.re, v.im));
-            }
-            std::fs::write(path, s)?;
-            Ok(())
-        };
-
-        write_f32("erb_feat", erb_feat)?;
-        write_cplx("spec_feat_cplx", spec_feat)?;
-        write_f32("mask", mask)?;
-
-        // df_coefs shape: [NB_DF, DF_ORDER, 2]
-        let mut df_lines = String::new();
-        for f in 0..NB_DF {
-            for o in 0..DF_ORDER {
-                let re = df_coefs[[f, o, 0]];
-                let im = df_coefs[[f, o, 1]];
-                df_lines.push_str(&format!("{},{},{},{}\n", f, o, re, im));
-            }
-        }
-        let df_path = out_dir.join(format!("df_coefs_frame_{}.txt", frame_idx));
-        std::fs::write(df_path, df_lines)?;
-
-        Ok(())
-    }
-
-    fn dump_debug_tensor(
-        &self,
-        name: &str,
-        frame_idx: usize,
-        shape: Vec<usize>,
-        data: &[f32],
-    ) -> Result<()> {
-        let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("debug_dump");
-        std::fs::create_dir_all(&out_dir)?;
-        let path = out_dir.join(format!("{}_frame_{}.txt", name, frame_idx));
-        let mut s = String::new();
-        s.push_str(&format!("# shape: {:?}\n", shape));
-        for (i, v) in data.iter().enumerate() {
-            s.push_str(&format!("{},{}\n", i, v));
-        }
-        std::fs::write(path, s)?;
-        Ok(())
-    }
-
-    fn apply_deep_filter(&mut self, spec: &mut [Complex32], df_coefs: &Array3<f32>) {
-        // Buffer contains the last DF_ORDER frames of ORIGINAL spectrum (before mask)
-        // Iterate from oldest to newest, multiply by coefs order 0..DF_ORDER-1
-        debug_assert!(self.rolling_spec_buf_x.len() >= DF_ORDER);
+    /// Apply deep filtering using flat coefs slice [NB_DF * DF_ORDER * 2].
+    /// Layout: [freq][order * 2] where each pair is (re, im).
+    fn apply_deep_filter_flat(spec: &mut [Complex32], rolling_spec_buf_x: &VecDeque<Vec<Complex32>>, df_coefs: &[f32]) {
+        debug_assert!(rolling_spec_buf_x.len() >= DF_ORDER);
+        debug_assert_eq!(df_coefs.len(), NB_DF * DF_ORDER * 2);
 
         for freq in 0..NB_DF {
-            let mut filtered = Complex32::new(0.0, 0.0);
+            let mut re = 0.0f32;
+            let mut im = 0.0f32;
+            let coef_base = freq * DF_ORDER * 2;
 
-            for (order, frame) in self.rolling_spec_buf_x.iter().take(DF_ORDER).enumerate() {
-                let orig_spec = frame[freq];
-                let coef = Complex32::new(df_coefs[[freq, order, 0]], df_coefs[[freq, order, 1]]);
-                filtered += orig_spec * coef;
+            for (order, frame) in rolling_spec_buf_x.iter().take(DF_ORDER).enumerate() {
+                let s = frame[freq];
+                let cr = df_coefs[coef_base + order * 2];
+                let ci = df_coefs[coef_base + order * 2 + 1];
+                // Complex multiply: (s.re + s.im*i) * (cr + ci*i)
+                re += s.re * cr - s.im * ci;
+                im += s.re * ci + s.im * cr;
             }
 
-            // Replace only the DF frequency bins with filtered output
-            spec[freq] = filtered;
+            spec[freq] = Complex32::new(re, im);
         }
     }
 }

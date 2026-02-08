@@ -3,6 +3,7 @@ name = "deepfilter-rt"
 version = "0.1.0"
 edition = "2021"
 description = "Real-time DeepFilterNet enhancement using ONNX Runtime"
+links = "deepfilter_rt"
 
 [dependencies]
 # DF crate for STFT/ISTFT and signal processing
@@ -29,7 +30,7 @@ log = "0.4"
 hound = "3.5"
 
 [features]
-default = []
+default = ["cuda"]
 
 # GPU/NPU acceleration
 cuda = ["ort/cuda"]
