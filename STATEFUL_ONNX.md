@@ -29,11 +29,14 @@ pip install torch deepfilternet onnx
 The export script is included at `scripts/export_onnx_stateful.py`:
 
 ```bash
-# Export to a model directory (e.g. dfn3_h0)
-python scripts/export_onnx_stateful.py models/dfn3_h0
+# Export using cached DeepFilterNet model (downloaded automatically)
+python scripts/export_onnx_stateful.py --to models/dfn3_h0
+
+# Export from a specific checkpoint/model directory
+python scripts/export_onnx_stateful.py --from path/to/checkpoint_dir --to models/dfn3_h0
 
 # Optionally provide a 48kHz WAV for tracing (uses synthetic audio if omitted)
-python scripts/export_onnx_stateful.py models/dfn3_h0 audio_48k.wav
+python scripts/export_onnx_stateful.py --to models/dfn3_h0 --wav audio_48k.wav
 ```
 
 This produces in the target directory:

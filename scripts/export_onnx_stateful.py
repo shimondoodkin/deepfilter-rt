@@ -4,20 +4,16 @@ Install dependencies:
     pip install torch deepfilternet onnx
 
 Usage:
-    python scripts/export_onnx_stateful.py <output_dir> [input.wav]
-
-    output_dir  - where to write enc.onnx, erb_dec.onnx, df_dec.onnx, config.ini
-    input.wav   - any 48kHz 16-bit mono WAV for tracing (optional, uses synthetic audio if omitted)
-
-Example:
-    python scripts/export_onnx_stateful.py models/dfn3_h0
+    python scripts/export_onnx_stateful.py --to models/dfn3_h0
+    python scripts/export_onnx_stateful.py --from path/to/checkpoint_dir --to models/dfn3_h0
+    python scripts/export_onnx_stateful.py --to models/dfn3_h0 --wav audio_48k.wav
 
 After export, merge into combined.onnx:
     python scripts/merge_onnx.py models/dfn3_h0
 """
 
+import argparse
 import os
-import sys
 import shutil
 import wave
 import struct
@@ -68,22 +64,39 @@ class EncoderWithState(torch.nn.Module):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Export stateful (GRU) DeepFilterNet ONNX models with h0/h1 hidden state."
+    )
+    parser.add_argument(
+        "--from", dest="source", default=None,
+        help="Source model/checkpoint directory (default: uses DeepFilterNet cached model)"
+    )
+    parser.add_argument(
+        "--to", required=True,
+        help="Output directory for enc.onnx, erb_dec.onnx, df_dec.onnx, config.ini"
+    )
+    parser.add_argument(
+        "--wav", default=None,
+        help="48kHz 16-bit mono WAV for tracing (optional, uses synthetic audio if omitted)"
+    )
+    args = parser.parse_args()
 
-    export_dir = sys.argv[1]
-    audio_path = sys.argv[2] if len(sys.argv) > 2 else None
+    export_dir = args.to
     os.makedirs(export_dir, exist_ok=True)
 
-    model, df_state, _, _ = init_df(model_base_dir=None)
+    if args.source:
+        print(f"Loading model from: {args.source}")
+        model, df_state, _, _ = init_df(model_base_dir=args.source)
+    else:
+        print("Loading model from DeepFilterNet cache")
+        model, df_state, _, _ = init_df(model_base_dir=None)
     model.eval()
 
     p = ModelParams()
 
-    if audio_path:
-        print(f"Using audio: {audio_path}")
-        audio = read_wav_mono_16(audio_path)
+    if args.wav:
+        print(f"Using audio: {args.wav}")
+        audio = read_wav_mono_16(args.wav)
     else:
         # Synthetic 1-second silence for tracing (no WAV file needed)
         print("Using synthetic audio for tracing")
@@ -168,23 +181,32 @@ def main():
         do_constant_folding=True,
     )
 
-    # Copy config.ini from DeepFilterNet cache
-    cache_dir = os.path.join(
-        os.path.expanduser("~"),
-        "AppData",
-        "Local",
-        "DeepFilterNet",
-        "DeepFilterNet",
-        "Cache",
-        "DeepFilterNet3",
-    )
-    cfg_src = os.path.join(cache_dir, "config.ini")
+    # Copy config.ini — prefer source dir, fall back to DeepFilterNet cache
     cfg_dst = os.path.join(export_dir, "config.ini")
-    if os.path.isfile(cfg_src):
-        shutil.copyfile(cfg_src, cfg_dst)
-        print(f"Copied config.ini from {cfg_src}")
-    else:
-        print(f"Warning: config.ini not found at {cfg_src}")
+    cfg_copied = False
+    if args.source:
+        cfg_src = os.path.join(args.source, "config.ini")
+        if os.path.isfile(cfg_src):
+            shutil.copyfile(cfg_src, cfg_dst)
+            print(f"Copied config.ini from {cfg_src}")
+            cfg_copied = True
+
+    if not cfg_copied:
+        cache_dir = os.path.join(
+            os.path.expanduser("~"),
+            "AppData",
+            "Local",
+            "DeepFilterNet",
+            "DeepFilterNet",
+            "Cache",
+            "DeepFilterNet3",
+        )
+        cfg_src = os.path.join(cache_dir, "config.ini")
+        if os.path.isfile(cfg_src):
+            shutil.copyfile(cfg_src, cfg_dst)
+            print(f"Copied config.ini from {cfg_src}")
+        else:
+            print(f"Warning: config.ini not found at {cfg_src}")
 
     print(f"\nExported stateful ONNX models to {export_dir}")
     print(f"Next step: python scripts/merge_onnx.py {export_dir}")
