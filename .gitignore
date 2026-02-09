@@ -3,3 +3,4 @@
 onnxruntime-win-x64*/
 .claude/
 scripts/_onnxsim_build/
+*.wav

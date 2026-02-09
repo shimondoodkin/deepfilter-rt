@@ -14,6 +14,8 @@
 use deepfilter_rt::{DeepFilterProcessor, HOP_SIZE, SAMPLE_RATE};
 use std::path::Path;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// A job sent from the producer (audio) thread to the DeepFilter consumer thread.
 struct DenoiseJob {
@@ -23,10 +25,8 @@ struct DenoiseJob {
     audio: Vec<f32>,
 }
 
-/// Result sent back from DeepFilter thread (optional — you could also write to a
-/// shared ring buffer or timeline instead).
+/// Result sent back from DeepFilter thread.
 struct DenoiseResult {
-    frame_idx: u64,
     denoised: Vec<f32>,
 }
 
@@ -84,23 +84,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (job_tx, job_rx) = mpsc::sync_channel::<DenoiseJob>(500);
     let (result_tx, result_rx) = mpsc::sync_channel::<DenoiseResult>(500);
 
+    let underrun_count = Arc::new(AtomicU64::new(0));
+    let underrun_count_thread = Arc::clone(&underrun_count);
+
     // ── DeepFilter consumer thread ────────────────────────────────────
     let df_thread = std::thread::spawn(move || {
         let mut proc = DeepFilterProcessor::new(&model_dir).expect("load DeepFilter model");
         proc.warmup().expect("DeepFilter warmup");
-        eprintln!("DeepFilter ready: {}", proc.variant().name());
+        let frame_budget = std::time::Duration::from_secs_f64(HOP_SIZE as f64 / SAMPLE_RATE as f64);
+        eprintln!("DeepFilter ready: {} (budget: {:.2}ms/frame)",
+                  proc.variant().name(), frame_budget.as_secs_f64() * 1000.0);
 
         let mut denoised = vec![0.0f32; HOP_SIZE];
+        let mut max_frame_time = std::time::Duration::ZERO;
+        let mut total_frame_time = std::time::Duration::ZERO;
+        let mut frame_count: u64 = 0;
 
         while let Ok(job) = job_rx.recv() {
             denoised.fill(0.0);
+
+            let t0 = std::time::Instant::now();
             proc.process_frame(&job.audio, &mut denoised)
                 .expect("denoise frame");
+            let dt = t0.elapsed();
+
+            total_frame_time += dt;
+            frame_count += 1;
+            if dt > max_frame_time {
+                max_frame_time = dt;
+            }
+            if dt > frame_budget {
+                let n = underrun_count_thread.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!("UNDERRUN frame {}: {:.2}ms > {:.2}ms budget (total: {})",
+                          job.frame_idx, dt.as_secs_f64() * 1000.0,
+                          frame_budget.as_secs_f64() * 1000.0, n);
+            }
 
             let _ = result_tx.send(DenoiseResult {
-                frame_idx: job.frame_idx,
                 denoised: denoised.clone(),
             });
+        }
+
+        if frame_count > 0 {
+            let avg_ms = total_frame_time.as_secs_f64() * 1000.0 / frame_count as f64;
+            eprintln!("Consumer stats: {} frames, avg: {:.2}ms, max: {:.2}ms",
+                      frame_count, avg_ms, max_frame_time.as_secs_f64() * 1000.0);
         }
     });
 
@@ -134,11 +162,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let elapsed = start.elapsed();
     let rtf = elapsed.as_secs_f32() / (mono.len() as f32 / SAMPLE_RATE as f32);
-    println!(
-        "Done in {:.2}s (RTF: {:.3}x realtime)",
-        elapsed.as_secs_f32(),
-        rtf
-    );
+    let underruns = underrun_count.load(Ordering::Relaxed);
+    println!("Done in {:.2}s (RTF: {:.3}x realtime, underruns: {})",
+             elapsed.as_secs_f32(), rtf, underruns);
 
     // ── Write output ──────────────────────────────────────────────────
     let out_spec = hound::WavSpec {

@@ -67,13 +67,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples.chunks(spec.channels as usize).map(|c| c[0]).collect()
     };
 
-    println!("Processing {} samples ({:.2}s) with streaming...",
-             mono.len(), mono.len() as f32 / SAMPLE_RATE as f32);
+    let frame_duration = std::time::Duration::from_secs_f64(HOP_SIZE as f64 / SAMPLE_RATE as f64);
+    println!("Processing {} samples ({:.2}s) with streaming... (budget: {:.2}ms/frame)",
+             mono.len(), mono.len() as f32 / SAMPLE_RATE as f32,
+             frame_duration.as_secs_f64() * 1000.0);
 
     // Simulate audio callback with small chunks
     let chunk_size = HOP_SIZE / 3;
     let mut out_samples: Vec<f32> = Vec::with_capacity(mono.len() + FFT_SIZE);
     let mut input_buf: Vec<f32> = Vec::with_capacity(HOP_SIZE);
+
+    let mut frame_count: u64 = 0;
+    let mut underrun_count: u64 = 0;
+    let mut max_frame_time = std::time::Duration::ZERO;
+    let mut total_frame_time = std::time::Duration::ZERO;
 
     let start = std::time::Instant::now();
 
@@ -82,7 +89,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while input_buf.len() >= HOP_SIZE {
             let frame_in: Vec<f32> = input_buf.drain(..HOP_SIZE).collect();
             let mut frame_out = vec![0.0f32; HOP_SIZE];
+
+            let t0 = std::time::Instant::now();
             processor.process_frame(&frame_in, &mut frame_out)?;
+            let dt = t0.elapsed();
+
+            total_frame_time += dt;
+            frame_count += 1;
+            if dt > max_frame_time {
+                max_frame_time = dt;
+            }
+            if dt > frame_duration {
+                underrun_count += 1;
+                eprintln!("UNDERRUN frame {}: {:.2}ms > {:.2}ms budget",
+                          frame_count, dt.as_secs_f64() * 1000.0,
+                          frame_duration.as_secs_f64() * 1000.0);
+            }
+
             out_samples.extend_from_slice(&frame_out);
         }
     }
@@ -98,7 +121,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let elapsed = start.elapsed();
     let rtf = elapsed.as_secs_f32() / (mono.len() as f32 / SAMPLE_RATE as f32);
+    let avg_ms = if frame_count > 0 {
+        total_frame_time.as_secs_f64() * 1000.0 / frame_count as f64
+    } else { 0.0 };
     println!("Done in {:.2}s (RTF: {:.3}x realtime)", elapsed.as_secs_f32(), rtf);
+    println!("Frames: {}, avg: {:.2}ms, max: {:.2}ms, underruns: {}",
+             frame_count, avg_ms, max_frame_time.as_secs_f64() * 1000.0, underrun_count);
 
     // Write output
     let out_spec = hound::WavSpec {

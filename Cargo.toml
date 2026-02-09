@@ -30,7 +30,7 @@ log = "0.4"
 hound = "3.5"
 
 [features]
-default = ["cuda"]
+default = []
 
 # GPU/NPU acceleration
 cuda = ["ort/cuda"]

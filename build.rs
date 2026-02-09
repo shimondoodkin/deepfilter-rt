@@ -123,13 +123,19 @@ fn copy_dlls_to_target(ort_lib_dir: &Path, use_cuda: bool) {
         ]);
     }
 
+    // Also copy to examples/ subdirectory (examples run from target/<profile>/examples/)
+    let target_examples = target_bin.join("examples");
+    let _ = fs::create_dir_all(&target_examples);
+
     for dll in dlls {
         let src = ort_lib_dir.join(dll);
-        let dst = target_bin.join(dll);
         if src.exists() {
-            match fs::copy(&src, &dst) {
-                Ok(_) => println!("cargo:warning=Copied {} to {}", dll, target_bin.display()),
-                Err(e) => println!("cargo:warning=Failed to copy {}: {}", dll, e),
+            for dest in [&target_bin, &target_examples] {
+                let dst = dest.join(dll);
+                match fs::copy(&src, &dst) {
+                    Ok(_) => println!("cargo:warning=Copied {} to {}", dll, dest.display()),
+                    Err(e) => println!("cargo:warning=Failed to copy {}: {}", dll, e),
+                }
             }
         }
     }
