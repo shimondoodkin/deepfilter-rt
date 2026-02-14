@@ -1,6 +1,10 @@
 //! Example: Process an audio file with DeepFilterNet (auto mode selection)
 //!
-//! Usage: cargo run --example process_file -- input.wav output.wav [model_dir/]
+//! Usage: cargo run --example process_file -- input.wav output.wav [model_dir/] [-D]
+//!
+//! The -D flag compensates algorithmic delay (STFT + model lookahead) by trimming
+//! the first N samples from the output. This matches the Tract CLI's -D behavior
+//! and Python's pad=True mode.
 
 use deepfilter_rt::{DeepFilterStream, SAMPLE_RATE, HOP_SIZE};
 use std::path::Path;
@@ -8,14 +12,21 @@ use std::path::Path;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <input.wav> <output.wav> [model_dir]", args[0]);
+        eprintln!("Usage: {} <input.wav> <output.wav> [model_dir] [-D]", args[0]);
         std::process::exit(1);
     }
 
-    let input_path = &args[1];
-    let output_path = &args[2];
-    let model_dir = if args.len() > 3 {
-        Path::new(&args[3]).to_path_buf()
+    let compensate_delay = args.iter().any(|a| a == "-D");
+    let positional: Vec<&String> = args[1..].iter().filter(|a| !a.starts_with('-')).collect();
+    if positional.len() < 2 {
+        eprintln!("Usage: {} <input.wav> <output.wav> [model_dir] [-D]", args[0]);
+        std::process::exit(1);
+    }
+
+    let input_path = positional[0];
+    let output_path = positional[1];
+    let model_dir = if positional.len() > 2 {
+        Path::new(positional[2]).to_path_buf()
     } else {
         // Default to models/dfn3 relative to crate root
         Path::new(env!("CARGO_MANIFEST_DIR")).join("models/dfn3_ll")
@@ -27,6 +38,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let variant = stream.variant();
     println!("Using model variant: {}", variant.name());
     println!("Inference mode: {}", if variant.is_stateful() { "stateful (h0)" } else { "stateless" });
+
+    let delay = stream.delay_samples();
+    println!("Algorithmic delay: {} samples ({:.1}ms){}",
+             delay, stream.latency_ms(),
+             if compensate_delay { " [compensating]" } else { "" });
 
     // Warm up to avoid cold-start latency affecting timing
     stream.warmup()?;
@@ -95,6 +111,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rtf = elapsed.as_secs_f32() / (mono.len() as f32 / SAMPLE_RATE as f32);
     println!("Done in {:.2}s (RTF: {:.3}x realtime)", elapsed.as_secs_f32(), rtf);
 
+    // Compensate delay by trimming the start (same as Tract's -D flag)
+    if compensate_delay && delay < output.len() {
+        output.drain(..delay);
+        println!("Delay compensated: trimmed first {} samples", delay);
+    }
+
     // Write output
     let out_spec = hound::WavSpec {
         channels: 1,
@@ -110,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     writer.finalize()?;
 
-    println!("Saved to {}", output_path);
+    println!("Saved {} samples to {}", output.len(), output_path);
 
     // Write per-frame latency CSV
     let csv_path = format!("{}.csv", output_path);

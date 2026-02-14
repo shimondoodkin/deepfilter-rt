@@ -134,6 +134,26 @@ def merge_models(model_dir: Path) -> onnx.ModelProto:
             if node.input[i] in enc_input_remap:
                 node.input[i] = enc_input_remap[node.input[i]]
 
+    # Decoder hidden state inputs: rename prefixed names back to user-facing names
+    # so they become combined model inputs (e.g., erb/erb_h0 -> erb_h0)
+    dec_input_remap: dict[str, str] = {}
+    for name in erb_input_names:
+        if name not in enc_output_names:  # not wired from encoder
+            prefixed = erb_rename[name]
+            dec_input_remap[prefixed] = name
+    for name in df_input_names:
+        if name not in enc_output_names:
+            prefixed = df_rename[name]
+            dec_input_remap[prefixed] = name
+
+    for node in list(erb_dec.graph.node) + list(df_dec.graph.node):
+        for i in range(len(node.input)):
+            if node.input[i] in dec_input_remap:
+                node.input[i] = dec_input_remap[node.input[i]]
+
+    if dec_input_remap:
+        print(f"Decoder input remap: {dec_input_remap}")
+
     # Build combined inputs from encoder's real inputs
     combined_inputs = []
     for inp in enc.graph.input:
@@ -148,10 +168,24 @@ def merge_models(model_dir: Path) -> onnx.ModelProto:
                 )
             )
 
+    # Add decoder GRU hidden state inputs (erb_h0, df_h0) as combined model inputs
+    for inp in list(erb_dec.graph.input) + list(df_dec.graph.input):
+        orig_name = inp.name.removeprefix("erb/").removeprefix("df/")
+        if orig_name in dec_input_remap.values():
+            combined_inputs.append(
+                helper.make_tensor_value_info(
+                    orig_name,
+                    inp.type.tensor_type.elem_type,
+                    [d.dim_value if d.dim_value > 0 else d.dim_param
+                     for d in inp.type.tensor_type.shape.dim],
+                )
+            )
+
     # Collect all nodes
     all_nodes = list(enc.graph.node) + list(erb_dec.graph.node) + list(df_dec.graph.node)
 
     # Combined outputs: lsnr (enc), m (erb_dec), coefs (df_dec), optionally h1 (enc)
+    # and decoder hidden states (erb_h1, df_h1) if present
     output_map = {
         "lsnr": enc_rename["lsnr"],
         "m": erb_rename["m"],
@@ -159,6 +193,10 @@ def merge_models(model_dir: Path) -> onnx.ModelProto:
     }
     if "h1" in enc_output_names:
         output_map["h1"] = enc_rename["h1"]
+    if "erb_h1" in erb_output_names:
+        output_map["erb_h1"] = erb_rename["erb_h1"]
+    if "df_h1" in df_output_names:
+        output_map["df_h1"] = df_rename["df_h1"]
 
     all_graph_outputs = {out.name: out for out in
                          list(enc.graph.output) + list(erb_dec.graph.output) + list(df_dec.graph.output)}

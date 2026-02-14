@@ -50,6 +50,7 @@ dependencies = [
  "ndarray 0.16.1",
  "num-complex",
  "ort",
+ "realfft",
  "thiserror",
 ]
 

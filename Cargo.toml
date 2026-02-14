@@ -26,6 +26,9 @@ thiserror = "1.0"
 # Logging (optional, users typically configure android_logger separately)
 log = "0.4"
 
+# Rolling module dependencies (only needed with "rolling" feature)
+realfft = { version = "3.1", optional = true }
+
 [dev-dependencies]
 hound = "3.5"
 
@@ -41,6 +44,9 @@ nnapi = ["ort/nnapi"]
 # Enables fp16 internally for faster inference - API remains f32
 # Example: features = ["nnapi", "fp16"] for Android with half-precision
 fp16 = []
+
+# Rolling module: standalone STFT/ISTFT, GRU, and normalization
+rolling = ["dep:realfft"]
 
 # Alternative: use df's built-in tract inference (no ONNX needed)
 # Uncomment to use tract instead of ort

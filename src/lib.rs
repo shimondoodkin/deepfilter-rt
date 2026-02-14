@@ -115,6 +115,11 @@
 //! Each processor instance is independent and `Send`. Create separate instances
 //! for parallel processing - they do not share state.
 
+/// Currently unused — streaming is handled by patched ONNX models
+/// (`combined_streaming.onnx`). See `scripts/patch_onnx_streaming.py`.
+#[cfg(feature = "rolling")]
+pub mod rolling;
+
 use deep_filter::DFState;
 use num_complex::Complex32;
 use ort::session::{builder::GraphOptimizationLevel, Session};
@@ -160,6 +165,22 @@ fn init_ort() -> Result<()> {
     Ok(())
 }
 
+/// ONNX session configuration.
+///
+/// - **Combined**: Single combined.onnx (windowed batch inference, existing approach).
+/// - **Streaming**: Split encoder (enc_conv + enc_gru) + separate decoder sessions.
+///   Processes one frame at a time through GRUs for proper state continuity.
+///   Achieves near-identical quality to Tract's PulsedModel streaming.
+enum Sessions {
+    Combined(Session),
+    Streaming {
+        enc_conv: Session,
+        enc_gru: Session,
+        erb_dec: Session,
+        df_dec: Session,
+    },
+}
+
 // Common parameters for all DeepFilterNet models
 pub const SAMPLE_RATE: usize = 48000;
 pub const FFT_SIZE: usize = 960;
@@ -173,6 +194,9 @@ pub const DEFAULT_NORM_ALPHA: f32 = 0.99;
 pub const MIN_DB_THRESH: f32 = -15.0;
 pub const MAX_DB_ERB_THRESH: f32 = 35.0;
 pub const MAX_DB_DF_THRESH: f32 = 35.0;
+/// For stateless models, use a larger window so the GRU warms up properly each frame.
+/// ~400ms of context at 10ms/frame. Trade-off: more computation per frame but smoother output.
+const STATELESS_WINDOW: usize = 40;
 
 /// Internal inference mode (derived from ModelVariant).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -306,7 +330,7 @@ fn parse_ini(content: &str) -> HashMap<String, String> {
 
 /// Real-time DeepFilterNet processor
 pub struct DeepFilterProcessor {
-    session: Session,
+    sessions: Sessions,
     df_state: DFState,
     rolling_spec_buf_x: VecDeque<Vec<Complex32>>, // noisy spec
     rolling_spec_buf_y: VecDeque<Vec<Complex32>>, // stage-1 enhanced spec
@@ -337,6 +361,14 @@ pub struct DeepFilterProcessor {
     inf_spec_data: Vec<f32>,     // [2 * enc_window * NB_DF]
     inf_mask: Vec<f32>,          // [NB_ERB]
     inf_df_coefs: Vec<f32>,      // [NB_DF * DF_ORDER * 2]
+    pre_gru_emb_dim: usize,      // pre-GRU embedding dim (conv_ch * NB_ERB / 4)
+    // Decoder GRU states (only used in StatefulH0 mode with fully-stateful models)
+    erb_dec_h: Vec<f32>,         // ERB decoder GRU hidden state
+    erb_dec_hidden_dim: usize,
+    erb_dec_num_layers: usize,
+    df_dec_h: Vec<f32>,          // DF decoder GRU hidden state
+    df_dec_hidden_dim: usize,
+    df_dec_num_layers: usize,
 }
 
 impl DeepFilterProcessor {
@@ -382,7 +414,8 @@ impl DeepFilterProcessor {
         init_ort()?;
         let inference_mode = variant.inference_mode();
 
-        let (df_lookahead, conv_lookahead, min_nb_erb_freqs, norm_alpha, enc_kernel_t, enc_hidden_dim) = {
+        let (df_lookahead, conv_lookahead, min_nb_erb_freqs, norm_alpha, enc_kernel_t, enc_hidden_dim,
+             pre_gru_emb_dim, erb_dec_num_layers, erb_dec_hidden_dim, df_dec_num_layers, df_dec_hidden_dim) = {
             let config_path = model_dir.join("config.ini");
             let content = fs::read_to_string(&config_path).unwrap_or_default();
             let params = parse_ini(&content);
@@ -407,6 +440,28 @@ impl DeepFilterProcessor {
                 .get("emb_hidden_dim")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(256);
+            // Pre-GRU embedding dim = conv_ch * nb_erb / 4 (output of combine layer)
+            let conv_ch = params
+                .get("conv_ch")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(64);
+            let pre_gru_emb_dim = conv_ch * NB_ERB / 4;
+            // ERB decoder GRU: emb_num_layers - 1 layers, hidden_dim = emb_hidden_dim
+            let emb_num_layers = params
+                .get("emb_num_layers")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(2);
+            let erb_dec_num_layers = emb_num_layers.saturating_sub(1).max(1);
+            let erb_dec_hidden_dim = enc_hidden_dim;
+            // DF decoder GRU: df_num_layers layers, hidden_dim = df_hidden_dim
+            let df_dec_num_layers = params
+                .get("df_num_layers")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(2);
+            let df_dec_hidden_dim = params
+                .get("df_hidden_dim")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(256);
             let norm_alpha = if let Some(tau) = params
                 .get("norm_tau")
                 .and_then(|s| s.parse::<f32>().ok())
@@ -425,7 +480,8 @@ impl DeepFilterProcessor {
             } else {
                 DEFAULT_NORM_ALPHA
             };
-            (df_lookahead, conv_lookahead, min_nb_erb_freqs, norm_alpha, enc_kernel_t, enc_hidden_dim)
+            (df_lookahead, conv_lookahead, min_nb_erb_freqs, norm_alpha, enc_kernel_t, enc_hidden_dim,
+             pre_gru_emb_dim, erb_dec_num_layers, erb_dec_hidden_dim, df_dec_num_layers, df_dec_hidden_dim)
         };
         let lookahead = df_lookahead.max(conv_lookahead);
 
@@ -482,21 +538,61 @@ impl DeepFilterProcessor {
             Ok(builder.commit_from_file(path)?)
         };
 
+        // Detect streaming mode: split encoder files exist
+        let enc_conv_path = model_dir.join("enc_conv.onnx");
+        let enc_gru_path = model_dir.join("enc_gru.onnx");
+        let erb_dec_path = model_dir.join("erb_dec.onnx");
+        let df_dec_path = model_dir.join("df_dec.onnx");
+        let combined_streaming_path = model_dir.join("combined_streaming.onnx");
         let combined_path = model_dir.join("combined.onnx");
-        let session = if combined_path.exists() {
-            build_session(combined_path)?
+
+        let (sessions, inference_mode) = if enc_conv_path.exists() && enc_gru_path.exists()
+            && erb_dec_path.exists() && df_dec_path.exists()
+        {
+            log::info!("Loading streaming model (split encoder + separate decoders)");
+            (Sessions::Streaming {
+                enc_conv: build_session(enc_conv_path)?,
+                enc_gru: build_session(enc_gru_path)?,
+                erb_dec: build_session(erb_dec_path)?,
+                df_dec: build_session(df_dec_path)?,
+            }, inference_mode)
+        } else if combined_streaming_path.exists() {
+            // Patched streaming model: combined.onnx with GRU states exposed
+            let session = build_session(combined_streaming_path)?;
+            let has_h0 = session.inputs().iter().any(|i| i.name() == "h0");
+            if !has_h0 {
+                return Err(DfError::Config(
+                    "combined_streaming.onnx exists but has no h0 input".to_string(),
+                ));
+            }
+            log::info!("Loading patched streaming model (combined_streaming.onnx)");
+            (Sessions::Combined(session), InferenceMode::StatefulH0)
+        } else if combined_path.exists() {
+            let session = build_session(combined_path)?;
+            let has_h0 = session.inputs().iter().any(|i| i.name() == "h0");
+            if inference_mode == InferenceMode::StatefulH0 && !has_h0 {
+                return Err(DfError::Config(
+                    "Model directory ends with _h0 but encoder has no h0 input".to_string(),
+                ));
+            }
+            (Sessions::Combined(session), inference_mode)
         } else {
             return Err(DfError::Config(
-                "combined.onnx not found. Run: python scripts/merge_onnx.py".to_string(),
+                "No model files found. Need either enc_conv.onnx+enc_gru.onnx+erb_dec.onnx+df_dec.onnx \
+                 (streaming), combined_streaming.onnx (patched), or combined.onnx (windowed).".to_string(),
             ));
         };
-        let has_h0 = session.inputs().iter().any(|i| i.name() == "h0");
-        if inference_mode == InferenceMode::StatefulH0 && !has_h0 {
-            return Err(DfError::Config(
-                "Model directory ends with _h0 but encoder has no h0 input".to_string(),
-            ));
-        }
-        let enc_window = enc_kernel_t;
+
+        // enc_window: how many frames of temporal context the encoder convolutions see.
+        // - StatefulH0: must be >= enc_kernel_t (typically 3) so convolutions have
+        //   enough context. T=1 starves them and produces ~4x quieter output.
+        // - StatelessWindowLast: larger window lets the (resetting) GRU warm up
+        //   each frame. Must be >= enc_kernel_t for the convolutions.
+        // Note: inference_mode may have been overridden above (combined_streaming.onnx).
+        let enc_window = match inference_mode {
+            InferenceMode::StatefulH0 => enc_kernel_t,
+            InferenceMode::StatelessWindowLast => STATELESS_WINDOW.max(enc_kernel_t),
+        };
 
         let mut df_state = DFState::new(SAMPLE_RATE, FFT_SIZE, HOP_SIZE, NB_ERB, min_nb_erb_freqs);
         df_state.init_norm_states(NB_DF);
@@ -520,9 +616,11 @@ impl DeepFilterProcessor {
         let enc_ring_pos = enc_window.saturating_sub(1);
         let enc_ring_count = enc_window.saturating_sub(1);
         let enc_h = vec![0.0f32; enc_hidden_dim];
+        let erb_dec_h = vec![0.0f32; erb_dec_num_layers * erb_dec_hidden_dim];
+        let df_dec_h = vec![0.0f32; df_dec_num_layers * df_dec_hidden_dim];
 
         Ok(Self {
-            session,
+            sessions,
             df_state,
             rolling_spec_buf_x,
             rolling_spec_buf_y,
@@ -550,6 +648,13 @@ impl DeepFilterProcessor {
             inf_spec_data: vec![0.0f32; 2 * enc_window * NB_DF],
             inf_mask: vec![0.0f32; NB_ERB],
             inf_df_coefs: vec![0.0f32; NB_DF * DF_ORDER * 2],
+            pre_gru_emb_dim,
+            erb_dec_h,
+            erb_dec_hidden_dim,
+            erb_dec_num_layers,
+            df_dec_h,
+            df_dec_hidden_dim,
+            df_dec_num_layers,
         })
     }
 
@@ -557,11 +662,22 @@ impl DeepFilterProcessor {
         self.variant
     }
 
+    /// Algorithmic delay in samples.
+    ///
+    /// This is the inherent processing delay: STFT overlap + model lookahead.
+    /// To get time-aligned output, trim this many samples from the start of the output
+    /// (matching the `-D` flag behavior from the Tract-based `deep-filter` CLI).
+    ///
+    /// - Non-LL models (lookahead=2): 480 + 2×480 = 1440 samples (30ms)
+    /// - LL models (lookahead=0): 480 samples (10ms)
+    pub fn delay_samples(&self) -> usize {
+        (FFT_SIZE - HOP_SIZE) + self.lookahead * HOP_SIZE
+    }
+
     pub fn reset(&mut self) {
         self.df_state.reset();
         self.df_state.init_norm_states(NB_DF);
         self.frames_processed = 0;
-        // Keep debug_dump_frame across resets
         self.rolling_spec_buf_x.clear();
         let buf_x_len = DF_ORDER.max(self.lookahead.max(1));
         for _ in 0..buf_x_len {
@@ -580,6 +696,8 @@ impl DeepFilterProcessor {
         self.enc_ring_pos = self.enc_window.saturating_sub(1);
         self.enc_ring_count = self.enc_window.saturating_sub(1);
         self.enc_h.fill(0.0);
+        self.erb_dec_h.fill(0.0);
+        self.df_dec_h.fill(0.0);
     }
 
     /// Perform warm-up inference to avoid cold-start latency
@@ -626,35 +744,54 @@ impl DeepFilterProcessor {
         self.df_state
             .feat_cplx(&self.work_spec_feat_input, self.norm_alpha, &mut self.work_spec_feat_cplx);
 
-        // 5. Buffer features for lookahead alignment (pad_feat behavior)
-        self.erb_feat_buf.push_back(self.work_erb_feat.clone());
-        self.spec_feat_buf.push_back(self.work_spec_feat_cplx.clone());
-        if self.erb_feat_buf.len() <= self.lookahead {
-            self.frames_processed = self.frames_processed.saturating_add(1);
-            for v in self.work_out_spec.iter_mut() { *v = Complex32::new(0.0, 0.0); }
-            self.df_state.synthesis(&mut self.work_out_spec, output);
-            return Ok(());
-        }
+        // 5. Buffer features and write to ring buffer.
+        // Streaming mode: no lookahead delay — features go directly to the ring.
+        //   The ring's pre-filled zeros provide the conv context that pad_feat gives
+        //   in batch mode. Features, noisy spec, and output are all at frame N.
+        // Combined mode: lookahead delay aligns features for the batch encoder.
+        let is_streaming = matches!(self.sessions, Sessions::Streaming { .. });
+        if is_streaming {
+            // Write current features directly to ring (no delay)
+            let ring_slot = self.enc_ring_pos % self.enc_window;
+            let erb_off = ring_slot * NB_ERB;
+            self.enc_erb_ring[erb_off..erb_off + NB_ERB]
+                .copy_from_slice(&self.work_erb_feat);
+            let spec_off = ring_slot * NB_DF * 2;
+            for (fi, c) in self.work_spec_feat_cplx.iter().enumerate() {
+                self.enc_spec_ring[spec_off + fi * 2] = c.re;
+                self.enc_spec_ring[spec_off + fi * 2 + 1] = c.im;
+            }
+            self.enc_ring_pos = self.enc_ring_pos.wrapping_add(1);
+            self.enc_ring_count = self.enc_ring_count.saturating_add(1).min(self.enc_window);
+        } else {
+            // Combined mode: buffer features with lookahead delay
+            self.erb_feat_buf.push_back(self.work_erb_feat.clone());
+            self.spec_feat_buf.push_back(self.work_spec_feat_cplx.clone());
+            if self.erb_feat_buf.len() <= self.lookahead {
+                self.frames_processed = self.frames_processed.saturating_add(1);
+                for v in self.work_out_spec.iter_mut() { *v = Complex32::new(0.0, 0.0); }
+                self.df_state.synthesis(&mut self.work_out_spec, output);
+                return Ok(());
+            }
 
-        // Write lookahead frame into ring buffer (no Vec clone — direct copy)
-        let ring_slot = self.enc_ring_pos % self.enc_window;
-        let erb_off = ring_slot * NB_ERB;
-        self.enc_erb_ring[erb_off..erb_off + NB_ERB]
-            .copy_from_slice(&self.erb_feat_buf[self.lookahead]);
-        let spec_off = ring_slot * NB_DF * 2;
-        for (fi, c) in self.spec_feat_buf[self.lookahead].iter().enumerate() {
-            self.enc_spec_ring[spec_off + fi * 2] = c.re;
-            self.enc_spec_ring[spec_off + fi * 2 + 1] = c.im;
-        }
-        self.enc_ring_pos = self.enc_ring_pos.wrapping_add(1);
-        self.enc_ring_count = self.enc_ring_count.saturating_add(1).min(self.enc_window);
+            let ring_slot = self.enc_ring_pos % self.enc_window;
+            let erb_off = ring_slot * NB_ERB;
+            self.enc_erb_ring[erb_off..erb_off + NB_ERB]
+                .copy_from_slice(&self.erb_feat_buf[self.lookahead]);
+            let spec_off = ring_slot * NB_DF * 2;
+            for (fi, c) in self.spec_feat_buf[self.lookahead].iter().enumerate() {
+                self.enc_spec_ring[spec_off + fi * 2] = c.re;
+                self.enc_spec_ring[spec_off + fi * 2 + 1] = c.im;
+            }
+            self.enc_ring_pos = self.enc_ring_pos.wrapping_add(1);
+            self.enc_ring_count = self.enc_ring_count.saturating_add(1).min(self.enc_window);
 
-        // Shift lookahead buffer
-        if self.erb_feat_buf.len() > self.lookahead + 1 {
-            self.erb_feat_buf.pop_front();
-        }
-        if self.spec_feat_buf.len() > self.lookahead + 1 {
-            self.spec_feat_buf.pop_front();
+            if self.erb_feat_buf.len() > self.lookahead + 1 {
+                self.erb_feat_buf.pop_front();
+            }
+            if self.spec_feat_buf.len() > self.lookahead + 1 {
+                self.spec_feat_buf.pop_front();
+            }
         }
 
         let min_required = self.inference_mode.min_required_frames(self.lookahead);
@@ -672,10 +809,19 @@ impl DeepFilterProcessor {
 
         let lsnr = self.run_inference(t)?;
 
-        // 6. Apply ERB mask to the centered frame in the rolling buffer (df_order - 1)
+        // 6. Apply ERB mask.
+        // In streaming mode, features/coefs/noisy-spec are all aligned to the current
+        // frame N. Apply the mask to spec_N (last in rolling buf) for correct alignment.
+        // In combined mode, the existing DF_ORDER-1 centering is used.
+        let is_streaming = matches!(self.sessions, Sessions::Streaming { .. });
+        let mask_idx = if is_streaming {
+            self.rolling_spec_buf_y.len().saturating_sub(1)
+        } else {
+            DF_ORDER - 1
+        };
         let apply_mask = lsnr <= MAX_DB_ERB_THRESH;
         let apply_zero_mask = lsnr < MIN_DB_THRESH;
-        if let Some(center_spec) = self.rolling_spec_buf_y.get_mut(DF_ORDER - 1) {
+        if let Some(center_spec) = self.rolling_spec_buf_y.get_mut(mask_idx) {
             if apply_mask {
                 if apply_zero_mask {
                     self.df_state.apply_mask(center_spec, &self.work_zeros);
@@ -685,9 +831,9 @@ impl DeepFilterProcessor {
             }
         }
 
-        // 7. Output the centered frame
+        // 7. Output the selected frame
         self.frames_processed = self.frames_processed.saturating_add(1);
-        if let Some(src) = self.rolling_spec_buf_y.get(DF_ORDER - 1) {
+        if let Some(src) = self.rolling_spec_buf_y.get(mask_idx) {
             self.work_out_spec.copy_from_slice(src);
         } else {
             for v in self.work_out_spec.iter_mut() { *v = Complex32::new(0.0, 0.0); }
@@ -733,54 +879,197 @@ impl DeepFilterProcessor {
     /// Run inference using pre-filled inf_erb_data/inf_spec_data buffers.
     /// Writes results into inf_mask and inf_df_coefs. Returns lsnr.
     fn run_inference(&mut self, t: usize) -> Result<f32> {
-        let take_idx = t.saturating_sub(1);
+        // Destructure self to get disjoint mutable borrows (sessions + state fields)
+        let Self {
+            sessions, enc_h, enc_hidden_dim, pre_gru_emb_dim, inference_mode,
+            erb_dec_h, erb_dec_num_layers, erb_dec_hidden_dim,
+            df_dec_h, df_dec_num_layers, df_dec_hidden_dim,
+            inf_erb_data, inf_spec_data, inf_mask, inf_df_coefs,
+            ..
+        } = self;
+
         let erb_len = t * NB_ERB;
         let spec_len = 2 * t * NB_DF;
+        let erb_tensor = Tensor::from_array(([1usize, 1, t, NB_ERB], inf_erb_data[..erb_len].to_vec()))?;
+        let spec_tensor = Tensor::from_array(([1usize, 2, t, NB_DF], inf_spec_data[..spec_len].to_vec()))?;
 
-        // Create tensors from pre-allocated data (ORT takes ownership of the Vec)
-        let erb_tensor = Tensor::from_array(([1usize, 1, t, NB_ERB], self.inf_erb_data[..erb_len].to_vec()))?;
-        let spec_tensor = Tensor::from_array(([1usize, 2, t, NB_DF], self.inf_spec_data[..spec_len].to_vec()))?;
+        match sessions {
+            Sessions::Combined(session) => {
+                // --- Windowed batch inference (existing approach) ---
+                // For StatefulH0 (patched streaming model), outputs are time-sliced
+                // to T=1 inside the ONNX graph, so always take index 0.
+                // For StatelessWindowLast, outputs have T=enc_window frames.
+                let take_idx = if *inference_mode == InferenceMode::StatefulH0 {
+                    0
+                } else {
+                    t.saturating_sub(1)
+                };
 
-        let outputs = if self.inference_mode == InferenceMode::StatefulH0 {
-            let h0_tensor = Tensor::from_array(([1usize, 1, self.enc_hidden_dim], self.enc_h.clone()))?;
-            self.session.run(ort::inputs![
-                "feat_erb" => erb_tensor,
-                "feat_spec" => spec_tensor,
-                "h0" => h0_tensor,
-            ])?
-        } else {
-            self.session.run(ort::inputs![
-                "feat_erb" => erb_tensor,
-                "feat_spec" => spec_tensor,
-            ])?
-        };
+                let outputs = if *inference_mode == InferenceMode::StatefulH0 {
+                    let h0_tensor = Tensor::from_array(([1usize, 1, *enc_hidden_dim], enc_h.clone()))?;
+                    let has_erb_h0 = session.inputs().iter().any(|i| i.name() == "erb_h0");
+                    let has_df_h0 = session.inputs().iter().any(|i| i.name() == "df_h0");
+                    if has_erb_h0 && has_df_h0 {
+                        let erb_h0_tensor = Tensor::from_array((
+                            [*erb_dec_num_layers, 1, *erb_dec_hidden_dim],
+                            erb_dec_h.clone(),
+                        ))?;
+                        let df_h0_tensor = Tensor::from_array((
+                            [*df_dec_num_layers, 1, *df_dec_hidden_dim],
+                            df_dec_h.clone(),
+                        ))?;
+                        session.run(ort::inputs![
+                            "feat_erb" => erb_tensor,
+                            "feat_spec" => spec_tensor,
+                            "h0" => h0_tensor,
+                            "erb_h0" => erb_h0_tensor,
+                            "df_h0" => df_h0_tensor,
+                        ])?
+                    } else {
+                        session.run(ort::inputs![
+                            "feat_erb" => erb_tensor,
+                            "feat_spec" => spec_tensor,
+                            "h0" => h0_tensor,
+                        ])?
+                    }
+                } else {
+                    session.run(ort::inputs![
+                        "feat_erb" => erb_tensor,
+                        "feat_spec" => spec_tensor,
+                    ])?
+                };
 
-        // Extract lsnr — read view directly, no .to_vec()
-        let (_lsnr_shape, lsnr_data) = outputs["lsnr"].try_extract_tensor::<f32>()?;
-        let lsnr = lsnr_data.get(take_idx).copied().unwrap_or(0.0);
+                let (_lsnr_shape, lsnr_data) = outputs["lsnr"].try_extract_tensor::<f32>()?;
+                let lsnr = lsnr_data.get(take_idx).copied().unwrap_or(0.0);
 
-        // Extract h1 for stateful models
-        if self.inference_mode == InferenceMode::StatefulH0 {
-            let (_h1_shape, h1_data) = outputs["h1"].try_extract_tensor::<f32>()?;
-            if h1_data.len() >= self.enc_hidden_dim {
-                self.enc_h.copy_from_slice(&h1_data[..self.enc_hidden_dim]);
+                if *inference_mode == InferenceMode::StatefulH0 {
+                    let (_h1_shape, h1_data) = outputs["h1"].try_extract_tensor::<f32>()?;
+                    if h1_data.len() >= *enc_hidden_dim {
+                        enc_h.copy_from_slice(&h1_data[..*enc_hidden_dim]);
+                    }
+                    if let Some(val) = outputs.get("erb_h1") {
+                        if let Ok((_shape, data)) = val.try_extract_tensor::<f32>() {
+                            let n = erb_dec_h.len().min(data.len());
+                            erb_dec_h[..n].copy_from_slice(&data[..n]);
+                        }
+                    }
+                    if let Some(val) = outputs.get("df_h1") {
+                        if let Ok((_shape, data)) = val.try_extract_tensor::<f32>() {
+                            let n = df_dec_h.len().min(data.len());
+                            df_dec_h[..n].copy_from_slice(&data[..n]);
+                        }
+                    }
+                }
+
+                let (mask_shape, mask_data) = outputs["m"].try_extract_tensor::<f32>()?;
+                let mask_t = mask_shape[2] as usize;
+                let mask_offset = take_idx.min(mask_t.saturating_sub(1)) * NB_ERB;
+                inf_mask.copy_from_slice(&mask_data[mask_offset..mask_offset + NB_ERB]);
+
+                let (coefs_shape, coefs_data) = outputs["coefs"].try_extract_tensor::<f32>()?;
+                let coefs_t = coefs_shape[1] as usize;
+                let coefs_frame_size = NB_DF * DF_ORDER * 2;
+                let coefs_offset = take_idx.min(coefs_t.saturating_sub(1)) * coefs_frame_size;
+                inf_df_coefs.copy_from_slice(&coefs_data[coefs_offset..coefs_offset + coefs_frame_size]);
+
+                Ok(lsnr)
+            }
+
+            Sessions::Streaming { enc_conv, enc_gru, erb_dec, df_dec } => {
+                // --- Streaming inference (true frame-by-frame) ---
+                // Each GRU processes exactly 1 frame per call with persistent state.
+
+                // Step 1: Encoder convolutions with T=t frames for context.
+                // Output is T=1 (last frame only, sliced in the ONNX model).
+                let conv_out = enc_conv.run(ort::inputs![
+                    "feat_erb" => erb_tensor,
+                    "feat_spec" => spec_tensor,
+                ])?;
+
+                // Extract pre-GRU embedding [1, 1, pre_gru_emb_dim]
+                let (_emb_shape, emb_data) = conv_out["emb"].try_extract_tensor::<f32>()?;
+                let emb_h = *pre_gru_emb_dim;
+                let emb_vec: Vec<f32> = emb_data[..emb_h].to_vec();
+
+                // Step 2: Encoder GRU with single frame + hidden state.
+                let emb_gru_in = Tensor::from_array(([1usize, 1, emb_h], emb_vec))?;
+                let h0_tensor = Tensor::from_array(([1usize, 1, *enc_hidden_dim], enc_h.clone()))?;
+                let gru_out = enc_gru.run(ort::inputs![
+                    "emb" => emb_gru_in,
+                    "h0" => h0_tensor,
+                ])?;
+
+                let (_lsnr_shape, lsnr_data) = gru_out["lsnr"].try_extract_tensor::<f32>()?;
+                let lsnr = lsnr_data[0];
+
+                let (_h1_shape, h1_data) = gru_out["h1"].try_extract_tensor::<f32>()?;
+                enc_h.copy_from_slice(&h1_data[..*enc_hidden_dim]);
+
+                let (_emb_out_shape, emb_out_data) = gru_out["emb_out"].try_extract_tensor::<f32>()?;
+                let emb_out_vec: Vec<f32> = emb_out_data[..emb_h].to_vec();
+
+                // Step 3: Extract skip connections from conv output (all T=1)
+                let to_shape = |s: &[i64]| -> Vec<usize> { s.iter().map(|&d| d as usize).collect() };
+
+                let (e0_s, e0_d) = conv_out["e0"].try_extract_tensor::<f32>()?;
+                let (e1_s, e1_d) = conv_out["e1"].try_extract_tensor::<f32>()?;
+                let (e2_s, e2_d) = conv_out["e2"].try_extract_tensor::<f32>()?;
+                let (e3_s, e3_d) = conv_out["e3"].try_extract_tensor::<f32>()?;
+                let (c0_s, c0_d) = conv_out["c0"].try_extract_tensor::<f32>()?;
+
+                let e0_t = Tensor::from_array((to_shape(&e0_s), e0_d.to_vec()))?;
+                let e1_t = Tensor::from_array((to_shape(&e1_s), e1_d.to_vec()))?;
+                let e2_t = Tensor::from_array((to_shape(&e2_s), e2_d.to_vec()))?;
+                let e3_t = Tensor::from_array((to_shape(&e3_s), e3_d.to_vec()))?;
+                let c0_t = Tensor::from_array((to_shape(&c0_s), c0_d.to_vec()))?;
+
+                // Step 4: ERB decoder with single frame + hidden state.
+                let emb_erb_tensor = Tensor::from_array(([1usize, 1, emb_h], emb_out_vec.clone()))?;
+                let erb_h0_tensor = Tensor::from_array((
+                    [*erb_dec_num_layers, 1, *erb_dec_hidden_dim],
+                    erb_dec_h.clone(),
+                ))?;
+                let erb_out = erb_dec.run(ort::inputs![
+                    "emb" => emb_erb_tensor,
+                    "e3" => e3_t,
+                    "e2" => e2_t,
+                    "e1" => e1_t,
+                    "e0" => e0_t,
+                    "erb_h0" => erb_h0_tensor,
+                ])?;
+
+                let (_mask_shape, mask_data) = erb_out["m"].try_extract_tensor::<f32>()?;
+                inf_mask.copy_from_slice(&mask_data[..NB_ERB]);
+
+                if let Ok((_shape, data)) = erb_out["erb_h1"].try_extract_tensor::<f32>() {
+                    let n = erb_dec_h.len().min(data.len());
+                    erb_dec_h[..n].copy_from_slice(&data[..n]);
+                }
+
+                // Step 5: DF decoder with single frame + hidden state.
+                let emb_df_tensor = Tensor::from_array(([1usize, 1, emb_h], emb_out_vec))?;
+                let df_h0_tensor = Tensor::from_array((
+                    [*df_dec_num_layers, 1, *df_dec_hidden_dim],
+                    df_dec_h.clone(),
+                ))?;
+                let df_out = df_dec.run(ort::inputs![
+                    "emb" => emb_df_tensor,
+                    "c0" => c0_t,
+                    "df_h0" => df_h0_tensor,
+                ])?;
+
+                let (_coefs_shape, coefs_data) = df_out["coefs"].try_extract_tensor::<f32>()?;
+                let coefs_frame_size = NB_DF * DF_ORDER * 2;
+                inf_df_coefs.copy_from_slice(&coefs_data[..coefs_frame_size]);
+
+                if let Ok((_shape, data)) = df_out["df_h1"].try_extract_tensor::<f32>() {
+                    let n = df_dec_h.len().min(data.len());
+                    df_dec_h[..n].copy_from_slice(&data[..n]);
+                }
+
+                Ok(lsnr)
             }
         }
-
-        // Extract mask — copy directly into pre-allocated buffer
-        let (mask_shape, mask_data) = outputs["m"].try_extract_tensor::<f32>()?;
-        let mask_t = mask_shape[2] as usize;
-        let mask_offset = take_idx.min(mask_t.saturating_sub(1)) * NB_ERB;
-        self.inf_mask.copy_from_slice(&mask_data[mask_offset..mask_offset + NB_ERB]);
-
-        // Extract DF coefs — copy directly into pre-allocated buffer
-        let (coefs_shape, coefs_data) = outputs["coefs"].try_extract_tensor::<f32>()?;
-        let coefs_t = coefs_shape[1] as usize;
-        let coefs_frame_size = NB_DF * DF_ORDER * 2;
-        let coefs_offset = take_idx.min(coefs_t.saturating_sub(1)) * coefs_frame_size;
-        self.inf_df_coefs.copy_from_slice(&coefs_data[coefs_offset..coefs_offset + coefs_frame_size]);
-
-        Ok(lsnr)
     }
 
     /// Apply deep filtering using flat coefs slice [NB_DF * DF_ORDER * 2].
@@ -929,13 +1218,17 @@ impl DeepFilterStream {
     /// - 10ms for low-latency (LL) variants
     /// - 30ms for standard variants (includes 2-frame lookahead)
     pub fn latency_ms(&self) -> f32 {
-        let base = (FFT_SIZE - HOP_SIZE) as f32 / SAMPLE_RATE as f32 * 1000.0;
-        if self.processor.variant.is_low_latency() {
-            base // 10ms
-        } else {
-            base + 20.0 // +2 frames lookahead = 30ms total
-        }
+        self.processor.delay_samples() as f32 / SAMPLE_RATE as f32 * 1000.0
     }
+
+    /// Algorithmic delay in samples.
+    ///
+    /// To get time-aligned output (matching Python's `pad=True` behavior or the
+    /// Tract CLI's `-D` flag), trim this many samples from the start of the output.
+    pub fn delay_samples(&self) -> usize {
+        self.processor.delay_samples()
+    }
+
 
     /// Access the underlying processor for advanced use.
     pub fn processor_mut(&mut self) -> &mut DeepFilterProcessor {
