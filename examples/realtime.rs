@@ -81,6 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut underrun_count: u64 = 0;
     let mut max_frame_time = std::time::Duration::ZERO;
     let mut total_frame_time = std::time::Duration::ZERO;
+    let mut latencies_us: Vec<u64> = Vec::new();
 
     let start = std::time::Instant::now();
 
@@ -99,6 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if dt > max_frame_time {
                 max_frame_time = dt;
             }
+            latencies_us.push(dt.as_micros() as u64);
             if dt > frame_duration {
                 underrun_count += 1;
                 eprintln!("UNDERRUN frame {}: {:.2}ms > {:.2}ms budget",
@@ -143,5 +145,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     writer.finalize()?;
 
     println!("Saved to {}", output_path);
+
+    // Write per-frame latency CSV
+    let csv_path = format!("{}.csv", output_path);
+    let mut csv = String::from("frame,latency_us,latency_ms\n");
+    for (i, &us) in latencies_us.iter().enumerate() {
+        csv.push_str(&format!("{},{},{:.3}\n", i, us, us as f64 / 1000.0));
+    }
+    std::fs::write(&csv_path, &csv)?;
+    println!("Latency CSV written to {}", csv_path);
+
     Ok(())
 }

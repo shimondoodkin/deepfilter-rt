@@ -496,10 +496,7 @@ impl DeepFilterProcessor {
                 "Model directory ends with _h0 but encoder has no h0 input".to_string(),
             ));
         }
-        let enc_window = match inference_mode {
-            InferenceMode::StatefulH0 => enc_kernel_t,
-            InferenceMode::StatelessWindowLast => enc_kernel_t + 2 * lookahead.max(1),
-        };
+        let enc_window = enc_kernel_t;
 
         let mut df_state = DFState::new(SAMPLE_RATE, FFT_SIZE, HOP_SIZE, NB_ERB, min_nb_erb_freqs);
         df_state.init_norm_states(NB_DF);

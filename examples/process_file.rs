@@ -2,7 +2,7 @@
 //!
 //! Usage: cargo run --example process_file -- input.wav output.wav [model_dir/]
 
-use deepfilter_rt::{DeepFilterStream, SAMPLE_RATE};
+use deepfilter_rt::{DeepFilterStream, SAMPLE_RATE, HOP_SIZE};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -77,11 +77,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Processing {} samples ({:.2}s)...", mono.len(),
              mono.len() as f32 / SAMPLE_RATE as f32);
 
-    // Process using streaming API
+    // Process using streaming API, one HOP_SIZE chunk at a time for latency measurement
     let start = std::time::Instant::now();
+    let mut output: Vec<f32> = Vec::with_capacity(mono.len());
+    let mut latencies_us: Vec<u64> = Vec::new();
 
-    let mut output = stream.process(&mono)?;
-    // Flush any remaining samples
+    for chunk in mono.chunks(HOP_SIZE) {
+        let t0 = std::time::Instant::now();
+        let out = stream.process(chunk)?;
+        let dt = t0.elapsed();
+        latencies_us.push(dt.as_micros() as u64);
+        output.extend(out);
+    }
     output.extend(stream.flush()?);
 
     let elapsed = start.elapsed();
@@ -104,5 +111,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     writer.finalize()?;
 
     println!("Saved to {}", output_path);
+
+    // Write per-frame latency CSV
+    let csv_path = format!("{}.csv", output_path);
+    let mut csv = String::from("frame,latency_us,latency_ms\n");
+    for (i, &us) in latencies_us.iter().enumerate() {
+        csv.push_str(&format!("{},{},{:.3}\n", i, us, us as f64 / 1000.0));
+    }
+    std::fs::write(&csv_path, &csv)?;
+    println!("Latency CSV written to {}", csv_path);
+
     Ok(())
 }

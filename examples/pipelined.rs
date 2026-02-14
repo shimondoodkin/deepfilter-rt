@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let underrun_count_thread = Arc::clone(&underrun_count);
 
     // ── DeepFilter consumer thread ────────────────────────────────────
-    let df_thread = std::thread::spawn(move || {
+    let df_thread = std::thread::spawn(move || -> Vec<u64> {
         let mut proc = DeepFilterProcessor::new(&model_dir).expect("load DeepFilter model");
         proc.warmup().expect("DeepFilter warmup");
         let frame_budget = std::time::Duration::from_secs_f64(HOP_SIZE as f64 / SAMPLE_RATE as f64);
@@ -99,6 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut max_frame_time = std::time::Duration::ZERO;
         let mut total_frame_time = std::time::Duration::ZERO;
         let mut frame_count: u64 = 0;
+        let mut latencies_us: Vec<u64> = Vec::new();
 
         while let Ok(job) = job_rx.recv() {
             denoised.fill(0.0);
@@ -110,6 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             total_frame_time += dt;
             frame_count += 1;
+            latencies_us.push(dt.as_micros() as u64);
             if dt > max_frame_time {
                 max_frame_time = dt;
             }
@@ -130,6 +132,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Consumer stats: {} frames, avg: {:.2}ms, max: {:.2}ms",
                       frame_count, avg_ms, max_frame_time.as_secs_f64() * 1000.0);
         }
+
+        latencies_us
     });
 
     // ── Producer: simulate audio I/O thread ───────────────────────────
@@ -151,14 +155,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         job_tx.send(job)?;
     }
     drop(job_tx); // signal consumer to finish
+    eprintln!("[DEBUG] producer done, job_tx dropped");
 
     // ── Collect results ───────────────────────────────────────────────
     let mut out_samples: Vec<f32> = Vec::with_capacity(mono.len());
+    let mut collected = 0u64;
     while let Ok(result) = result_rx.recv() {
         out_samples.extend_from_slice(&result.denoised);
+        collected += 1;
     }
+    eprintln!("[DEBUG] collected {} results, waiting for df_thread join", collected);
 
-    df_thread.join().unwrap();
+    let latencies_us = df_thread.join().unwrap();
+    eprintln!("[DEBUG] df_thread joined");
 
     let elapsed = start.elapsed();
     let rtf = elapsed.as_secs_f32() / (mono.len() as f32 / SAMPLE_RATE as f32);
@@ -180,5 +189,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     writer.finalize()?;
 
     println!("Saved to {}", output_path);
+
+    // Write per-frame latency CSV
+    let csv_path = format!("{}.csv", output_path);
+    let mut csv = String::from("frame,latency_us,latency_ms\n");
+    for (i, &us) in latencies_us.iter().enumerate() {
+        csv.push_str(&format!("{},{},{:.3}\n", i, us, us as f64 / 1000.0));
+    }
+    std::fs::write(&csv_path, &csv)?;
+    println!("Latency CSV written to {}", csv_path);
+
     Ok(())
 }
