@@ -4,7 +4,7 @@ Real-time speech enhancement using [DeepFilterNet](https://github.com/Rikorose/D
 
 ## Overview
 
-This crate provides frame-by-frame audio denoising using the DeepFilterNet neural network. It runs a single merged ONNX model per frame for minimal inference overhead, combining:
+This crate provides frame-by-frame audio denoising using the DeepFilterNet neural network. It supports multiple streaming inference modes with persistent GRU state for smooth, real-time output, combining:
 
 - **df crate**: STFT/ISTFT and feature extraction (from DeepFilterNet)
 - **ort**: ONNX Runtime for neural network inference (CPU, CUDA, NNAPI, CoreML)
@@ -61,12 +61,20 @@ All models from [DeepFilterNet releases](https://github.com/Rikorose/DeepFilterN
 
 | Model | Lookahead | Latency | Mode | Description |
 |-------|-----------|---------|------|-------------|
-| `dfn2` | 2 frames | ~30ms | Stateless | DeepFilterNet2, standard |
-| `dfn2_ll` | 0 | ~10ms | Stateless | DeepFilterNet2, low latency |
-| `dfn2_h0` | 2 frames | ~30ms | Stateful | DeepFilterNet2, GRU states |
-| `dfn3` | 2 frames | ~30ms | Stateless | DeepFilterNet3, improved |
-| `dfn3_ll` | 0 | ~10ms | Stateless | DeepFilterNet3-LL, best real-time |
-| `dfn3_h0` | 2 frames | ~30ms | Stateful | DeepFilterNet3, best quality |
+| `dfn2` | 2 frames | ~30ms | Patched streaming | DeepFilterNet2, standard |
+| `dfn2_ll` | 0 | ~10ms | Patched streaming | DeepFilterNet2, low latency |
+| `dfn2_h0` | 2 frames | ~30ms | Stateful (enc only) | DeepFilterNet2, GRU states |
+| `dfn3` | 2 frames | ~30ms | Patched streaming | DeepFilterNet3, improved |
+| `dfn3_ll` | 0 | ~10ms | Patched streaming | DeepFilterNet3-LL, low latency |
+| `dfn3_h0` | 2 frames | ~30ms | Streaming (split) | DeepFilterNet3, best quality |
+
+### Inference Modes
+
+1. **Streaming (split encoder)** — Best quality. Uses separate ONNX files (`enc_conv.onnx` + `enc_gru.onnx` + `erb_dec.onnx` + `df_dec.onnx`) with all GRU states exported from PyTorch.
+2. **Patched streaming** — Universal, near-best quality. Uses `combined_streaming.onnx` created by ONNX graph surgery from any `combined.onnx`. Auto-detected when present.
+3. **Stateless window (fallback)** — Slowest. Uses `combined.onnx` with no GRU state persistence. Feeds a window of 40 frames for GRU warm-up.
+
+See `MODES.md` for details on how each mode works and how to patch models.
 
 **Common parameters** (all models):
 - Sample rate: 48000 Hz
@@ -86,7 +94,11 @@ deepfilter-rt = { git = "https://github.com/shimondoodkin/deepfilter-rt" }
 ### Requirements
 
 - ONNX Runtime dynamic library (auto-downloaded by `ort` on desktop, or provide `libonnxruntime.so` for Android)
-- Model files: `combined.onnx` + `config.ini` per variant (included in `models/`)
+- Model files per variant (included in `models/`):
+  - `config.ini` (always required)
+  - `combined_streaming.onnx` (patched streaming mode, recommended), or
+  - `enc_conv.onnx` + `enc_gru.onnx` + `erb_dec.onnx` + `df_dec.onnx` (split streaming), or
+  - `combined.onnx` (stateless fallback)
 
 ## Usage
 
@@ -205,6 +217,19 @@ cargo run --example realtime -- input.wav output.wav models/dfn3_ll
 cargo run --example pipelined -- input.wav output.wav models/dfn3_ll
 ```
 
+## Patching Models for Streaming
+
+Pre-patched `combined_streaming.onnx` files are included. To re-patch (e.g. after updating source models):
+
+```bash
+# Patch one or more model directories
+python scripts/patch_onnx_streaming.py models/dfn3 models/dfn2 models/dfn3_ll models/dfn2_ll
+
+# Creates combined_streaming.onnx in each directory — auto-detected by the Rust code
+```
+
+The patch script converts any stateless `combined.onnx` into a streaming model by exposing GRU hidden states as I/O and inserting time-slice nodes. See `MODES.md` for details.
+
 ## Merging Models
 
 Pre-merged `combined.onnx` files are included for all 6 variants. If you need to re-merge (e.g. after updating source models):
@@ -233,14 +258,20 @@ The merge script merges `enc.onnx`, `erb_dec.onnx`, and `df_dec.onnx` into a sin
 
 ## Performance
 
-Single merged model reduces per-frame ORT overhead from 3 dispatches to 1. Combined with flat ring buffers and pre-allocated I/O, the hot path has zero heap allocations.
+All models process within the 10ms frame budget on CPU. Combined with flat ring buffers and pre-allocated I/O, the hot path has zero heap allocations.
 
-| Model | CPU | CUDA | Notes |
-|-------|-----|------|-------|
-| dfn2_ll | ~0.1-0.2x RTF | faster | Fast, good for embedded |
-| dfn3_ll | ~0.3-0.5x RTF | faster | Larger but better quality |
+**Benchmark results** (34s audio, Windows, ONNX Runtime CPU):
 
-RTF = Real-Time Factor (< 1.0 means faster than real-time).
+| Model | Mode | RTF | Mean (ms) | Corr vs Python | SNR (dB) |
+|-------|------|-----|-----------|----------------|----------|
+| dfn3_h0 | Streaming (split) | 0.132x | 1.3 | 0.9955 | 20.4 |
+| dfn3 | Patched streaming | 0.105x | 1.0 | 0.9904 | 17.0 |
+| dfn3_ll | Patched streaming | 0.315x | 3.1 | 0.9540 | 10.4 |
+| dfn2_h0 | Combined stateful | 0.145x | 1.4 | 0.7813 | 3.0 |
+| dfn2 | Patched streaming | 0.130x | 1.3 | 0.9660 | -0.4 |
+| dfn2_ll | Patched streaming | 0.140x | 1.4 | 0.9539 | 2.9 |
+
+RTF = Real-Time Factor (< 1.0 means faster than real-time). Correlation and SNR measured against Python DeepFilterNet reference output with delay compensation (`-D` flag).
 
 ## Thread Count
 
@@ -301,8 +332,9 @@ Auto-detected from folder name and `config.ini`.
 
 ## More Docs
 
+- `ARCHITECTURE.md` - Full DeepFilterNet3 technical reference (signal flow, encoder/decoder, GRU internals)
+- `MODES.md` - Inference modes, ONNX patching, benchmark results
 - `ONNX_RUNTIME_ANDROID_SETUP.md` - Complete Android/NNAPI setup guide
-- `MODES.md` - Runtime mode selection and LL vs non-LL behavior
 - `STATEFUL_ONNX.md` - How to export stateful ONNX models
 - `API.md` - Detailed usage notes
 
