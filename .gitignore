@@ -6,3 +6,4 @@ scripts/_onnxsim_build/
 *.wav
 *.csv
 DeepFilterNet/
+__pycache__

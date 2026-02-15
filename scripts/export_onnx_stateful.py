@@ -1,25 +1,32 @@
-"""Export fully-stateful DeepFilterNet ONNX models with all GRU hidden states.
+"""Export stateful streaming DeepFilterNet ONNX models with all GRU hidden states.
 
-Exports 3 GRU hidden states (not just the encoder's):
-  - enc h0/h1:  encoder emb_gru  (1 layer, emb_hidden_dim)
-  - erb h0/h1:  ERB decoder emb_gru  (emb_num_layers-1 layers, emb_hidden_dim)
-  - df  h0/h1:  DF decoder df_gru  (df_num_layers layers, df_hidden_dim)
+Creates *_streaming.onnx files that coexist with original stateless models.
+Supports both DFN2 (with alpha output) and DFN3.
+
+Exports:
+  - enc_conv_streaming.onnx:   encoder convolutions only (stateless, T[-1:] sliced)
+  - enc_gru_streaming.onnx:    encoder GRU with h0/h1 state
+  - erb_dec_streaming.onnx:    ERB decoder with erb_h0/erb_h1 state I/O
+  - df_dec_streaming.onnx:     DF decoder with df_h0/df_h1 state I/O (+alpha for DFN2)
+  - enc.onnx:                  full stateful encoder (h0/h1)
+
+Optionally also exports combined_streaming.onnx (single file, ~3x faster inference)
+via --combined (direct PyTorch export) or --merge (ONNX graph surgery).
+
+Original enc.onnx, erb_dec.onnx, df_dec.onnx are NOT modified.
 
 Install dependencies:
     pip install torch deepfilternet onnx
 
 Usage:
     python scripts/export_onnx_stateful.py --to models/dfn3_h0
-    python scripts/export_onnx_stateful.py --from path/to/checkpoint_dir --to models/dfn3_h0
-
-After export, merge into combined.onnx:
-    python scripts/merge_onnx.py models/dfn3_h0
+    python scripts/export_onnx_stateful.py --to models/dfn3_h0 --combined
+    python scripts/export_onnx_stateful.py --to models/dfn3_h0 --merge
 """
 
 import argparse
 import os
 import shutil
-from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -126,16 +133,32 @@ class ErbDecoderWithState(torch.nn.Module):
         return m, erb_h1
 
 
+def _df_dec_has_alpha(df_dec):
+    """Detect whether DfDecoder actually uses alpha by checking its forward return type.
+
+    DFN2's forward returns (coefs, alpha), DFN3's returns just coefs.
+    Both may have df_fc_a attribute, but only DFN2 uses it in forward().
+    """
+    try:
+        import inspect
+        src = inspect.getsource(df_dec.forward)
+        # DFN2 returns "return c, alpha" — check for alpha in return statements
+        return "alpha" in src and "df_fc_a" in src
+    except (OSError, TypeError):
+        return False
+
+
 class DfDecoderWithState(torch.nn.Module):
     """DF decoder wrapper that exposes the df_gru hidden state as I/O.
 
-    Matches DFN3 DfDecoder structure:
-      df_gru (SqueezedGRU_S) + df_skip -> df_out + df_convp -> coefs
+    Works with both DFN3 (returns coefs only) and DFN2 (returns coefs + alpha).
+    Auto-detects DFN2 by inspecting the original forward method.
     """
 
     def __init__(self, df_dec):
         super().__init__()
         self.df_dec = df_dec
+        self.has_alpha = _df_dec_has_alpha(df_dec)
 
     def forward(self, emb, c0, df_h0):
         # emb: [B,T,H], c0: [B,C,T,F], df_h0: GRU hidden state
@@ -147,9 +170,45 @@ class DfDecoderWithState(torch.nn.Module):
             c = c + self.df_dec.df_skip(emb)
 
         c0 = self.df_dec.df_convp(c0).permute(0, 2, 3, 1)  # [B, T, F, O*2]
+
+        if self.has_alpha:
+            # DFN2: also generate alpha (importance weight)
+            alpha = self.df_dec.df_fc_a(c)
+
         c = self.df_dec.df_out(c)  # [B, T, F*O*2]
         c = c.view(b, t, self.df_dec.df_bins, self.df_dec.df_out_ch) + c0
+
+        if self.has_alpha:
+            return c, alpha, df_h1
         return c, df_h1
+
+
+class CombinedStreamingModel(torch.nn.Module):
+    """Full streaming pipeline in a single model: enc_conv + enc_gru + erb_dec + df_dec.
+
+    Produces combined_streaming.onnx — a single ONNX file with all GRU states as I/O.
+    ~3x faster than 4 separate sessions since ONNX runtime only runs 1 session per frame.
+    """
+
+    def __init__(self, enc, erb_dec, df_dec):
+        super().__init__()
+        self.enc_conv = EncoderConvOnly(enc)
+        self.enc_gru = EncoderGruOnly(enc)
+        self.erb_dec = ErbDecoderWithState(erb_dec)
+        self.df_dec = DfDecoderWithState(df_dec)
+        self.has_alpha = self.df_dec.has_alpha
+
+    def forward(self, feat_erb, feat_spec, h0, erb_h0, df_h0):
+        e0, e1, e2, e3, emb, c0 = self.enc_conv(feat_erb, feat_spec)
+        emb, lsnr, h1 = self.enc_gru(emb, h0)
+        m, erb_h1 = self.erb_dec(emb, e3, e2, e1, e0, erb_h0)
+        df_out = self.df_dec(emb, c0, df_h0)
+        if self.has_alpha:
+            coefs, alpha, df_h1 = df_out
+            return m, coefs, alpha, lsnr, h1, erb_h1, df_h1
+        else:
+            coefs, df_h1 = df_out
+            return m, coefs, lsnr, h1, erb_h1, df_h1
 
 
 def main():
@@ -163,6 +222,14 @@ def main():
     parser.add_argument(
         "--to", required=True,
         help="Output directory for enc.onnx, erb_dec.onnx, df_dec.onnx, config.ini"
+    )
+    parser.add_argument(
+        "--combined", action="store_true",
+        help="Also export combined_streaming.onnx directly (single ONNX file, ~3x faster)"
+    )
+    parser.add_argument(
+        "--merge", action="store_true",
+        help="Create combined_streaming.onnx via ONNX graph surgery (alternative to --combined)"
     )
     args = parser.parse_args()
 
@@ -184,7 +251,7 @@ def main():
 
     audio = F.pad(audio, (0, df_state.fft_size()))
 
-    spec, feat_erb, feat_spec = df_features(audio, df_state, p.nb_df, device="cpu")
+    _spec, feat_erb, feat_spec = df_features(audio, df_state, p.nb_df, device="cpu")
 
     # Encoder export expects feat_spec with re/im in channel axis
     feat_spec_enc = feat_spec.transpose(1, 4).squeeze(4)
@@ -220,7 +287,7 @@ def main():
 
     # --- Split encoder: conv-only (stateless) ---
     enc_conv = EncoderConvOnly(model.enc)
-    enc_conv_path = os.path.join(export_dir, "enc_conv.onnx")
+    enc_conv_path = os.path.join(export_dir, "enc_conv_streaming.onnx")
     print(f"Exporting encoder conv-only to {enc_conv_path}")
     torch.onnx.export(
         enc_conv,
@@ -245,7 +312,7 @@ def main():
         _, _, _, _, pre_gru_emb, _ = enc_conv(feat_erb, feat_spec_enc)
     # For streaming: T=1 frame
     pre_gru_emb_1 = pre_gru_emb[:, :1, :]  # [B, 1, H]
-    enc_gru_path = os.path.join(export_dir, "enc_gru.onnx")
+    enc_gru_path = os.path.join(export_dir, "enc_gru_streaming.onnx")
     print(f"Exporting encoder GRU-only to {enc_gru_path}")
     torch.onnx.export(
         enc_gru_mod,
@@ -282,7 +349,7 @@ def main():
     erb_h0 = torch.zeros(erb_num_layers, emb.shape[0], erb_hidden_dim)
 
     erb_stateful = ErbDecoderWithState(model.erb_dec)
-    erb_path = os.path.join(export_dir, "erb_dec.onnx")
+    erb_path = os.path.join(export_dir, "erb_dec_streaming.onnx")
     print(f"Exporting ERB decoder to {erb_path} (GRU: {erb_num_layers} layers, {erb_hidden_dim} hidden)")
     torch.onnx.export(
         erb_stateful,
@@ -315,21 +382,29 @@ def main():
     df_h0 = torch.zeros(df_num_layers, emb.shape[0], df_hidden_dim)
 
     df_stateful = DfDecoderWithState(model.df_dec)
-    df_path = os.path.join(export_dir, "df_dec.onnx")
-    print(f"Exporting DF decoder to {df_path} (GRU: {df_num_layers} layers, {df_hidden_dim} hidden)")
+    has_alpha = df_stateful.has_alpha
+    df_path = os.path.join(export_dir, "df_dec_streaming.onnx")
+    alpha_info = ", +alpha" if has_alpha else ""
+    print(f"Exporting DF decoder to {df_path} (GRU: {df_num_layers} layers, {df_hidden_dim} hidden{alpha_info})")
+
+    output_names = ["coefs", "alpha", "df_h1"] if has_alpha else ["coefs", "df_h1"]
+    dynamic_axes = {
+        "emb": {1: "S"},
+        "c0": {2: "S"},
+        "coefs": {1: "S"},
+        "df_h0": {1: "B"},
+        "df_h1": {1: "B"},
+    }
+    if has_alpha:
+        dynamic_axes["alpha"] = {1: "S"}
+
     torch.onnx.export(
         df_stateful,
         (emb, c0, df_h0),
         df_path,
         input_names=["emb", "c0", "df_h0"],
-        output_names=["coefs", "df_h1"],
-        dynamic_axes={
-            "emb": {1: "S"},
-            "c0": {2: "S"},
-            "coefs": {1: "S"},
-            "df_h0": {1: "B"},
-            "df_h1": {1: "B"},
-        },
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
         opset_version=14,
         do_constant_folding=True,
     )
@@ -362,13 +437,72 @@ def main():
             print(f"Warning: config.ini not found at {cfg_src}")
 
     print(f"\nExported fully-stateful ONNX models to {export_dir}")
-    print(f"  enc:      h0/h1  ({1} layer, {p.emb_hidden_dim} hidden)")
-    print(f"  enc_conv: stateless conv-only (for streaming)")
-    print(f"  enc_gru:  h0/h1  ({1} layer, {p.emb_hidden_dim} hidden, for streaming)")
-    print(f"  erb_dec:  erb_h0/erb_h1  ({erb_num_layers} layers, {erb_hidden_dim} hidden)")
-    print(f"  df_dec:   df_h0/df_h1  ({df_num_layers} layers, {df_hidden_dim} hidden)")
-    print(f"\nFor combined model: python scripts/merge_onnx.py {export_dir}")
-    print(f"For streaming: use enc_conv.onnx + enc_gru.onnx + erb_dec.onnx + df_dec.onnx directly")
+    print(f"  enc.onnx:                  h0/h1  ({1} layer, {p.emb_hidden_dim} hidden)")
+    print(f"  enc_conv_streaming.onnx:   stateless conv-only")
+    print(f"  enc_gru_streaming.onnx:    h0/h1  ({1} layer, {p.emb_hidden_dim} hidden)")
+    print(f"  erb_dec_streaming.onnx:    erb_h0/erb_h1  ({erb_num_layers} layers, {erb_hidden_dim} hidden)")
+    alpha_str = " + alpha" if has_alpha else ""
+    print(f"  df_dec_streaming.onnx:     df_h0/df_h1  ({df_num_layers} layers, {df_hidden_dim} hidden{alpha_str})")
+    print(f"\nOriginal enc.onnx, erb_dec.onnx, df_dec.onnx are NOT modified.")
+
+    # Optionally export combined_streaming.onnx
+    if args.combined:
+        combined_mod = CombinedStreamingModel(model.enc, model.erb_dec, model.df_dec)
+        combined_mod.eval()
+
+        # Get kernel_t for conv context window
+        kernel_t = 2
+        try:
+            w = model.enc.erb_conv0
+            if hasattr(w, 'conv'):
+                kernel_t = w.conv.kernel_size[0]
+        except Exception:
+            pass
+
+        erb_trace = feat_erb[:, :, :kernel_t, :]
+        spec_trace = feat_spec_enc[:, :, :kernel_t, :]
+
+        if has_alpha:
+            comb_outputs = ["m", "coefs", "alpha", "lsnr", "h1", "erb_h1", "df_h1"]
+        else:
+            comb_outputs = ["m", "coefs", "lsnr", "h1", "erb_h1", "df_h1"]
+
+        comb_path = os.path.join(export_dir, "combined_streaming.onnx")
+        print(f"\nExporting combined model to {comb_path}")
+        torch.onnx.export(
+            combined_mod,
+            (erb_trace, spec_trace, h0, erb_h0, df_h0),
+            comb_path,
+            input_names=["feat_erb", "feat_spec", "h0", "erb_h0", "df_h0"],
+            output_names=comb_outputs,
+            dynamic_axes={
+                "feat_erb": {2: "S"},
+                "feat_spec": {2: "S"},
+            },
+            opset_version=14,
+            do_constant_folding=True,
+        )
+        size_mb = os.path.getsize(comb_path) / (1024 * 1024)
+        print(f"  Saved {comb_path} ({size_mb:.1f} MB)")
+
+    elif args.merge:
+        try:
+            from pathlib import Path
+            from merge_split_models import merge_split_models
+            import onnx
+
+            print(f"\nMerging split models into combined_streaming.onnx...")
+            combined_graph = merge_split_models(Path(export_dir))
+            out_path = os.path.join(export_dir, "combined_streaming.onnx")
+            onnx.save(combined_graph, out_path)
+            size_mb = os.path.getsize(out_path) / (1024 * 1024)
+            print(f"  Saved {out_path} ({size_mb:.1f} MB)")
+        except ImportError as e:
+            print(f"\nCould not merge: {e}")
+            print(f"Run manually: python scripts/merge_split_models.py {export_dir}")
+
+    if not args.combined and not args.merge:
+        print(f"\nFor combined: --combined (direct) or --merge (ONNX surgery)")
 
 
 if __name__ == "__main__":

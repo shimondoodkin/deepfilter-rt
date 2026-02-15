@@ -342,7 +342,7 @@ pub struct DeepFilterProcessor {
     enc_ring_pos: usize,         // write position in ring (0..enc_window-1)
     enc_ring_count: usize,       // frames written so far (saturates at enc_window)
     frames_processed: usize,
-    lookahead: usize,
+    lookahead: usize,       // model's conv_lookahead (determines delay and DF centering)
     enc_h: Vec<f32>,
     enc_hidden_dim: usize,
     enc_window: usize,
@@ -539,10 +539,22 @@ impl DeepFilterProcessor {
         };
 
         // Detect streaming mode: split encoder files exist
-        let enc_conv_path = model_dir.join("enc_conv.onnx");
-        let enc_gru_path = model_dir.join("enc_gru.onnx");
-        let erb_dec_path = model_dir.join("erb_dec.onnx");
-        let df_dec_path = model_dir.join("df_dec.onnx");
+        let enc_conv_path = model_dir.join("enc_conv_streaming.onnx");
+        let enc_gru_path = model_dir.join("enc_gru_streaming.onnx");
+        // Streaming decoders: prefer *_streaming.onnx (coexists with originals),
+        // fall back to erb_dec.onnx/df_dec.onnx for backward compatibility
+        let erb_dec_streaming_path = model_dir.join("erb_dec_streaming.onnx");
+        let df_dec_streaming_path = model_dir.join("df_dec_streaming.onnx");
+        let erb_dec_path = if erb_dec_streaming_path.exists() {
+            erb_dec_streaming_path
+        } else {
+            model_dir.join("erb_dec.onnx")
+        };
+        let df_dec_path = if df_dec_streaming_path.exists() {
+            df_dec_streaming_path
+        } else {
+            model_dir.join("df_dec.onnx")
+        };
         let combined_streaming_path = model_dir.join("combined_streaming.onnx");
         let combined_path = model_dir.join("combined.onnx");
 
@@ -550,12 +562,13 @@ impl DeepFilterProcessor {
             && erb_dec_path.exists() && df_dec_path.exists()
         {
             log::info!("Loading streaming model (split encoder + separate decoders)");
+            // Split streaming always uses StatefulH0 (GRU states are persistent)
             (Sessions::Streaming {
                 enc_conv: build_session(enc_conv_path)?,
                 enc_gru: build_session(enc_gru_path)?,
                 erb_dec: build_session(erb_dec_path)?,
                 df_dec: build_session(df_dec_path)?,
-            }, inference_mode)
+            }, InferenceMode::StatefulH0)
         } else if combined_streaming_path.exists() {
             // Patched streaming model: combined.onnx with GRU states exposed
             let session = build_session(combined_streaming_path)?;
@@ -578,20 +591,21 @@ impl DeepFilterProcessor {
             (Sessions::Combined(session), inference_mode)
         } else {
             return Err(DfError::Config(
-                "No model files found. Need either enc_conv.onnx+enc_gru.onnx+erb_dec.onnx+df_dec.onnx \
+                "No model files found. Need either enc_conv_streaming.onnx+enc_gru_streaming.onnx+erb_dec.onnx+df_dec.onnx \
                  (streaming), combined_streaming.onnx (patched), or combined.onnx (windowed).".to_string(),
             ));
         };
 
         // enc_window: how many frames of temporal context the encoder convolutions see.
-        // - StatefulH0: must be >= enc_kernel_t (typically 3) so convolutions have
-        //   enough context. T=1 starves them and produces ~4x quieter output.
-        // - StatelessWindowLast: larger window lets the (resetting) GRU warm up
-        //   each frame. Must be >= enc_kernel_t for the convolutions.
-        // Note: inference_mode may have been overridden above (combined_streaming.onnx).
-        let enc_window = match inference_mode {
-            InferenceMode::StatefulH0 => enc_kernel_t,
-            InferenceMode::StatelessWindowLast => STATELESS_WINDOW.max(enc_kernel_t),
+        // Split streaming: use STATELESS_WINDOW for maximum conv context (only enc_conv
+        //   processes T frames; GRU/decoders process T=1, so it's still fast).
+        // Combined StatefulH0: use enc_kernel_t (minimum conv context). Larger windows
+        //   slow down combined inference since the entire graph processes T frames.
+        // StatelessWindowLast: large window lets the (resetting) GRU warm up each frame.
+        let enc_window = match (&sessions, inference_mode) {
+            (Sessions::Streaming { .. }, _) => STATELESS_WINDOW.max(enc_kernel_t),
+            (_, InferenceMode::StatefulH0) => enc_kernel_t,
+            (_, InferenceMode::StatelessWindowLast) => STATELESS_WINDOW.max(enc_kernel_t),
         };
 
         let mut df_state = DFState::new(SAMPLE_RATE, FFT_SIZE, HOP_SIZE, NB_ERB, min_nb_erb_freqs);
@@ -662,14 +676,25 @@ impl DeepFilterProcessor {
         self.variant
     }
 
+    /// Model lookahead in frames (from config.ini conv_lookahead).
+    ///
+    /// - `0`: LL (low-latency) model — causal, 10ms delay
+    /// - `2`: Standard model — 2-frame lookahead, 30ms delay, best quality
+    ///
+    /// Lookahead is fixed by the model variant. Use LL models (dfn3_ll, dfn2_ll)
+    /// for lowest latency, non-LL models (dfn3_h0, dfn3) for best quality.
+    pub fn lookahead(&self) -> usize {
+        self.lookahead
+    }
+
     /// Algorithmic delay in samples.
     ///
     /// This is the inherent processing delay: STFT overlap + model lookahead.
     /// To get time-aligned output, trim this many samples from the start of the output
     /// (matching the `-D` flag behavior from the Tract-based `deep-filter` CLI).
     ///
-    /// - Non-LL models (lookahead=2): 480 + 2×480 = 1440 samples (30ms)
     /// - LL models (lookahead=0): 480 samples (10ms)
+    /// - Standard models (lookahead=2): 1440 samples (30ms)
     pub fn delay_samples(&self) -> usize {
         (FFT_SIZE - HOP_SIZE) + self.lookahead * HOP_SIZE
     }
@@ -745,12 +770,12 @@ impl DeepFilterProcessor {
             .feat_cplx(&self.work_spec_feat_input, self.norm_alpha, &mut self.work_spec_feat_cplx);
 
         // 5. Buffer features and write to ring buffer.
-        // Streaming mode: no lookahead delay — features go directly to the ring.
-        //   The ring's pre-filled zeros provide the conv context that pad_feat gives
-        //   in batch mode. Features, noisy spec, and output are all at frame N.
-        // Combined mode: lookahead delay aligns features for the batch encoder.
-        let is_streaming = matches!(self.sessions, Sessions::Streaming { .. });
-        if is_streaming {
+        // Stateful streaming (split or merged combined_streaming): no lookahead delay —
+        //   features go directly to the ring. The ring's pre-filled zeros provide the
+        //   conv context that pad_feat gives in batch mode.
+        // Stateless windowed: lookahead delay aligns features for the batch encoder.
+        let direct_features = self.inference_mode == InferenceMode::StatefulH0;
+        if direct_features {
             // Write current features directly to ring (no delay)
             let ring_slot = self.enc_ring_pos % self.enc_window;
             let erb_off = ring_slot * NB_ERB;
@@ -810,15 +835,13 @@ impl DeepFilterProcessor {
         let lsnr = self.run_inference(t)?;
 
         // 6. Apply ERB mask.
-        // In streaming mode, features/coefs/noisy-spec are all aligned to the current
-        // frame N. Apply the mask to spec_N (last in rolling buf) for correct alignment.
-        // In combined mode, the existing DF_ORDER-1 centering is used.
-        let is_streaming = matches!(self.sessions, Sessions::Streaming { .. });
-        let mask_idx = if is_streaming {
-            self.rolling_spec_buf_y.len().saturating_sub(1)
-        } else {
-            DF_ORDER - 1
-        };
+        // Delay output by conv_lookahead frames to give the encoder conv access to
+        // "future" features — matching batch-mode pad_feat behavior.
+        // At physical time N, the ring has [f(N-2), f(N-1), f(N)]. By applying the mask
+        // to spectrum[N-lookahead], the conv's receptive field provides lookahead context
+        // for the output frame. For LL models (lookahead=0), no delay — mask goes to
+        // the latest frame. Formula: len - 1 - lookahead = DF_ORDER - 1 for all modes.
+        let mask_idx = self.rolling_spec_buf_y.len().saturating_sub(1 + self.lookahead);
         let apply_mask = lsnr <= MAX_DB_ERB_THRESH;
         let apply_zero_mask = lsnr < MIN_DB_THRESH;
         if let Some(center_spec) = self.rolling_spec_buf_y.get_mut(mask_idx) {
@@ -986,9 +1009,9 @@ impl DeepFilterProcessor {
                     "feat_spec" => spec_tensor,
                 ])?;
 
-                // Extract pre-GRU embedding [1, 1, pre_gru_emb_dim]
-                let (_emb_shape, emb_data) = conv_out["emb"].try_extract_tensor::<f32>()?;
-                let emb_h = *pre_gru_emb_dim;
+                // Extract pre-GRU embedding [1, 1, emb_dim]
+                let (emb_shape, emb_data) = conv_out["emb"].try_extract_tensor::<f32>()?;
+                let emb_h = *emb_shape.last().unwrap_or(&(*pre_gru_emb_dim as i64)) as usize;
                 let emb_vec: Vec<f32> = emb_data[..emb_h].to_vec();
 
                 // Step 2: Encoder GRU with single frame + hidden state.
@@ -1005,8 +1028,9 @@ impl DeepFilterProcessor {
                 let (_h1_shape, h1_data) = gru_out["h1"].try_extract_tensor::<f32>()?;
                 enc_h.copy_from_slice(&h1_data[..*enc_hidden_dim]);
 
-                let (_emb_out_shape, emb_out_data) = gru_out["emb_out"].try_extract_tensor::<f32>()?;
-                let emb_out_vec: Vec<f32> = emb_out_data[..emb_h].to_vec();
+                let (emb_out_shape, emb_out_data) = gru_out["emb_out"].try_extract_tensor::<f32>()?;
+                let emb_out_h = *emb_out_shape.last().unwrap_or(&(emb_h as i64)) as usize;
+                let emb_out_vec: Vec<f32> = emb_out_data[..emb_out_h].to_vec();
 
                 // Step 3: Extract skip connections from conv output (all T=1)
                 let to_shape = |s: &[i64]| -> Vec<usize> { s.iter().map(|&d| d as usize).collect() };
@@ -1024,7 +1048,7 @@ impl DeepFilterProcessor {
                 let c0_t = Tensor::from_array((to_shape(&c0_s), c0_d.to_vec()))?;
 
                 // Step 4: ERB decoder with single frame + hidden state.
-                let emb_erb_tensor = Tensor::from_array(([1usize, 1, emb_h], emb_out_vec.clone()))?;
+                let emb_erb_tensor = Tensor::from_array(([1usize, 1, emb_out_h], emb_out_vec.clone()))?;
                 let erb_h0_tensor = Tensor::from_array((
                     [*erb_dec_num_layers, 1, *erb_dec_hidden_dim],
                     erb_dec_h.clone(),
@@ -1047,7 +1071,7 @@ impl DeepFilterProcessor {
                 }
 
                 // Step 5: DF decoder with single frame + hidden state.
-                let emb_df_tensor = Tensor::from_array(([1usize, 1, emb_h], emb_out_vec))?;
+                let emb_df_tensor = Tensor::from_array(([1usize, 1, emb_out_h], emb_out_vec))?;
                 let df_h0_tensor = Tensor::from_array((
                     [*df_dec_num_layers, 1, *df_dec_hidden_dim],
                     df_dec_h.clone(),
@@ -1215,8 +1239,8 @@ impl DeepFilterStream {
 
     /// Algorithmic latency in milliseconds.
     ///
-    /// - 10ms for low-latency (LL) variants
-    /// - 30ms for standard variants (includes 2-frame lookahead)
+    /// - LL models: 10ms
+    /// - Standard models: 30ms
     pub fn latency_ms(&self) -> f32 {
         self.processor.delay_samples() as f32 / SAMPLE_RATE as f32 * 1000.0
     }
@@ -1229,6 +1253,8 @@ impl DeepFilterStream {
         self.processor.delay_samples()
     }
 
+    /// Model lookahead in frames (0 for LL, 2 for standard).
+    pub fn lookahead(&self) -> usize { self.processor.lookahead() }
 
     /// Access the underlying processor for advanced use.
     pub fn processor_mut(&mut self) -> &mut DeepFilterProcessor {

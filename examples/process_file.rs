@@ -5,6 +5,10 @@
 //! The -D flag compensates algorithmic delay (STFT + model lookahead) by trimming
 //! the first N samples from the output. This matches the Tract CLI's -D behavior
 //! and Python's pad=True mode.
+//!
+//! Lookahead is determined by the model variant:
+//!   LL models (dfn3_ll, dfn2_ll):   lookahead=0, 10ms delay
+//!   Standard models (dfn3_h0, dfn3): lookahead=2, 30ms delay, best quality
 
 use deepfilter_rt::{DeepFilterStream, SAMPLE_RATE, HOP_SIZE};
 use std::path::Path;
@@ -37,7 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = DeepFilterStream::new(&model_dir)?;
     let variant = stream.variant();
     println!("Using model variant: {}", variant.name());
-    println!("Inference mode: {}", if variant.is_stateful() { "stateful (h0)" } else { "stateless" });
+    println!("Lookahead: {} frames ({}ms delay)",
+             stream.lookahead(), stream.latency_ms() as u32);
 
     let delay = stream.delay_samples();
     println!("Algorithmic delay: {} samples ({:.1}ms){}",

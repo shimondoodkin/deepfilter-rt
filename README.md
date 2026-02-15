@@ -61,17 +61,17 @@ All models from [DeepFilterNet releases](https://github.com/Rikorose/DeepFilterN
 
 | Model | Lookahead | Latency | Mode | Description |
 |-------|-----------|---------|------|-------------|
-| `dfn2` | 2 frames | ~30ms | Patched streaming | DeepFilterNet2, standard |
-| `dfn2_ll` | 0 | ~10ms | Patched streaming | DeepFilterNet2, low latency |
-| `dfn2_h0` | 2 frames | ~30ms | Stateful (enc only) | DeepFilterNet2, GRU states |
-| `dfn3` | 2 frames | ~30ms | Patched streaming | DeepFilterNet3, improved |
-| `dfn3_ll` | 0 | ~10ms | Patched streaming | DeepFilterNet3-LL, low latency |
-| `dfn3_h0` | 2 frames | ~30ms | Streaming (split) | DeepFilterNet3, best quality |
+| `dfn2` | 2 frames | ~30ms | Split streaming | DeepFilterNet2, standard |
+| `dfn2_ll` | 0 | ~10ms | Split streaming | DeepFilterNet2, low latency |
+| `dfn2_h0` | 2 frames | ~30ms | Split streaming | DeepFilterNet2, GRU states |
+| `dfn3` | 2 frames | ~30ms | Split streaming | DeepFilterNet3, improved |
+| `dfn3_ll` | 0 | ~10ms | Split streaming | DeepFilterNet3-LL, low latency |
+| `dfn3_h0` | 2 frames | ~30ms | Split streaming | DeepFilterNet3, best quality |
 
 ### Inference Modes
 
-1. **Streaming (split encoder)** — Best quality. Uses separate ONNX files (`enc_conv.onnx` + `enc_gru.onnx` + `erb_dec.onnx` + `df_dec.onnx`) with all GRU states exported from PyTorch.
-2. **Patched streaming** — Universal, near-best quality. Uses `combined_streaming.onnx` created by ONNX graph surgery from any `combined.onnx`. Auto-detected when present.
+1. **Split streaming (recommended)** — Best quality. Uses separate ONNX files (`enc_conv_streaming.onnx` + `enc_gru_streaming.onnx` + `erb_dec_streaming.onnx` + `df_dec_streaming.onnx`) with all GRU states as explicit I/O. Created by ONNX surgery (`split_encoder_and_patch_decoders.py`) or PyTorch export.
+2. **Patched streaming (legacy)** — Lower quality. Uses `combined_streaming.onnx` created by `patch_onnx_streaming.py`. Superseded by split streaming.
 3. **Stateless window (fallback)** — Slowest. Uses `combined.onnx` with no GRU state persistence. Feeds a window of 40 frames for GRU warm-up.
 
 See `MODES.md` for details on how each mode works and how to patch models.
@@ -97,7 +97,7 @@ deepfilter-rt = { git = "https://github.com/shimondoodkin/deepfilter-rt" }
 - Model files per variant (included in `models/`):
   - `config.ini` (always required)
   - `combined_streaming.onnx` (patched streaming mode, recommended), or
-  - `enc_conv.onnx` + `enc_gru.onnx` + `erb_dec.onnx` + `df_dec.onnx` (split streaming), or
+  - `enc_conv_streaming.onnx` + `enc_gru_streaming.onnx` + `erb_dec_streaming.onnx` + `df_dec_streaming.onnx` (split streaming), or
   - `combined.onnx` (stateless fallback)
 
 ## Usage
@@ -217,18 +217,30 @@ cargo run --example realtime -- input.wav output.wav models/dfn3_ll
 cargo run --example pipelined -- input.wav output.wav models/dfn3_ll
 ```
 
-## Patching Models for Streaming
+## Splitting Models for Streaming (Recommended)
 
-Pre-patched `combined_streaming.onnx` files are included. To re-patch (e.g. after updating source models):
+Pre-split streaming models are included. To regenerate (e.g. after updating source models):
 
 ```bash
-# Patch one or more model directories
-python scripts/patch_onnx_streaming.py models/dfn3 models/dfn2 models/dfn3_ll models/dfn2_ll
+# Split encoder and patch decoders for streaming
+python scripts/split_encoder_and_patch_decoders.py models/dfn3 models/dfn3_ll models/dfn2 models/dfn2_ll
 
-# Creates combined_streaming.onnx in each directory — auto-detected by the Rust code
+# Creates enc_conv_streaming.onnx, enc_gru_streaming.onnx, erb_dec_streaming.onnx, df_dec_streaming.onnx in each directory
+# The Rust code auto-detects and uses them (highest priority)
 ```
 
-The patch script converts any stateless `combined.onnx` into a streaming model by exposing GRU hidden states as I/O and inserting time-slice nodes. See `MODES.md` for details.
+This produces split streaming models that match Tract reference output with 47.7 dB SNR (DFN3).
+
+### Legacy: Patching combined.onnx
+
+The older `patch_onnx_streaming.py` approach creates a single `combined_streaming.onnx` but
+achieves lower quality (17.0 dB SNR). Use the split approach above instead.
+
+```bash
+python scripts/patch_onnx_streaming.py models/dfn3 models/dfn2 models/dfn3_ll models/dfn2_ll
+```
+
+See `MODES.md` for details on all inference modes.
 
 ## Merging Models
 
@@ -260,18 +272,15 @@ The merge script merges `enc.onnx`, `erb_dec.onnx`, and `df_dec.onnx` into a sin
 
 All models process within the 10ms frame budget on CPU. Combined with flat ring buffers and pre-allocated I/O, the hot path has zero heap allocations.
 
-**Benchmark results** (34s audio, Windows, ONNX Runtime CPU):
+**Benchmark results** (34s audio, Windows, ONNX Runtime CPU, vs Tract reference with `-D`):
 
-| Model | Mode | RTF | Mean (ms) | Corr vs Python | SNR (dB) |
-|-------|------|-----|-----------|----------------|----------|
-| dfn3_h0 | Streaming (split) | 0.132x | 1.3 | 0.9955 | 20.4 |
-| dfn3 | Patched streaming | 0.105x | 1.0 | 0.9904 | 17.0 |
-| dfn3_ll | Patched streaming | 0.315x | 3.1 | 0.9540 | 10.4 |
-| dfn2_h0 | Combined stateful | 0.145x | 1.4 | 0.7813 | 3.0 |
-| dfn2 | Patched streaming | 0.130x | 1.3 | 0.9660 | -0.4 |
-| dfn2_ll | Patched streaming | 0.140x | 1.4 | 0.9539 | 2.9 |
+| Model | Mode | RTF | Corr vs Tract | SNR (dB) |
+|-------|------|-----|---------------|----------|
+| dfn3 | Combined streaming | 0.11x | 0.999991 | 47.6 |
+| dfn3 | Split streaming | 0.34x | 0.999991 | 47.6 |
+| dfn3_ll | Split streaming | 0.82x | 0.999605 | 31.0 |
 
-RTF = Real-Time Factor (< 1.0 means faster than real-time). Correlation and SNR measured against Python DeepFilterNet reference output with delay compensation (`-D` flag).
+RTF = Real-Time Factor (< 1.0 means faster than real-time). Both split and combined streaming achieve near-perfect match to Tract reference output.
 
 ## Thread Count
 
