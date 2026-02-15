@@ -1,29 +1,57 @@
-//! Example: Process an audio file with DeepFilterNet (auto mode selection)
+//! Example: Process an audio file with DeepFilterNet
 //!
-//! Usage: cargo run --example process_file -- input.wav output.wav [model_dir/] [-D]
+//! Usage: cargo run --example process_file -- input.wav output.wav [model_dir/] [-D] [--mode split|combined|stateless]
 //!
 //! The -D flag compensates algorithmic delay (STFT + model lookahead) by trimming
 //! the first N samples from the output. This matches the Tract CLI's -D behavior
 //! and Python's pad=True mode.
 //!
+//! The --mode flag selects the inference mode:
+//!   split     — 4 separate ONNX sessions (default if split files exist)
+//!   combined  — single combined_streaming.onnx
+//!   stateless — single combined.onnx with 40-frame window warm-up
+//!
 //! Lookahead is determined by the model variant:
 //!   LL models (dfn3_ll, dfn2_ll):   lookahead=0, 10ms delay
 //!   Standard models (dfn3_h0, dfn3): lookahead=2, 30ms delay, best quality
 
-use deepfilter_rt::{DeepFilterStream, SAMPLE_RATE, HOP_SIZE};
+use deepfilter_rt::{DeepFilterStream, SessionMode, SAMPLE_RATE, HOP_SIZE};
 use std::path::Path;
+
+fn parse_session_mode(args: &[String]) -> SessionMode {
+    for (i, a) in args.iter().enumerate() {
+        if a == "--mode" {
+            if let Some(val) = args.get(i + 1) {
+                return match val.as_str() {
+                    "split" => SessionMode::SplitStreaming,
+                    "combined" => SessionMode::CombinedStreaming,
+                    "stateless" => SessionMode::Stateless,
+                    other => {
+                        eprintln!("Unknown mode '{}', using auto. Options: split, combined, stateless", other);
+                        SessionMode::Auto
+                    }
+                };
+            }
+        }
+    }
+    SessionMode::Auto
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <input.wav> <output.wav> [model_dir] [-D]", args[0]);
+        eprintln!("Usage: {} <input.wav> <output.wav> [model_dir] [-D] [--mode split|combined|stateless]", args[0]);
         std::process::exit(1);
     }
 
     let compensate_delay = args.iter().any(|a| a == "-D");
-    let positional: Vec<&String> = args[1..].iter().filter(|a| !a.starts_with('-')).collect();
+    let session_mode = parse_session_mode(&args);
+    let positional: Vec<&String> = args[1..].iter()
+        .filter(|a| !a.starts_with('-'))
+        .filter(|a| !["split", "combined", "stateless"].contains(&a.as_str()))
+        .collect();
     if positional.len() < 2 {
-        eprintln!("Usage: {} <input.wav> <output.wav> [model_dir] [-D]", args[0]);
+        eprintln!("Usage: {} <input.wav> <output.wav> [model_dir] [-D] [--mode split|combined|stateless]", args[0]);
         std::process::exit(1);
     }
 
@@ -32,15 +60,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_dir = if positional.len() > 2 {
         Path::new(positional[2]).to_path_buf()
     } else {
-        // Default to models/dfn3 relative to crate root
         Path::new(env!("CARGO_MANIFEST_DIR")).join("models/dfn3_ll")
     };
 
     // Create processor
     println!("Loading model from {:?}...", model_dir);
-    let mut stream = DeepFilterStream::new(&model_dir)?;
+    let mut stream = DeepFilterStream::with_mode(&model_dir, session_mode, Some(2))?;
     let variant = stream.variant();
     println!("Using model variant: {}", variant.name());
+    println!("Inference mode: {}", stream.inference_mode_name());
     println!("Lookahead: {} frames ({}ms delay)",
              stream.lookahead(), stream.latency_ms() as u32);
 

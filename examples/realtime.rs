@@ -1,31 +1,55 @@
 //! Example: Simulated real-time streaming with model selection
 //!
-//! Usage: cargo run --example realtime -- input.wav output.wav [model_dir]
+//! Usage: cargo run --example realtime -- input.wav output.wav [model_dir] [--mode split|combined|stateless]
 
-use deepfilter_rt::{DeepFilterProcessor, SAMPLE_RATE, HOP_SIZE, FFT_SIZE};
+use deepfilter_rt::{DeepFilterProcessor, SessionMode, SAMPLE_RATE, HOP_SIZE, FFT_SIZE};
 use std::path::Path;
+
+fn parse_session_mode(args: &[String]) -> SessionMode {
+    for (i, a) in args.iter().enumerate() {
+        if a == "--mode" {
+            if let Some(val) = args.get(i + 1) {
+                return match val.as_str() {
+                    "split" => SessionMode::SplitStreaming,
+                    "combined" => SessionMode::CombinedStreaming,
+                    "stateless" => SessionMode::Stateless,
+                    other => {
+                        eprintln!("Unknown mode '{}', using auto. Options: split, combined, stateless", other);
+                        SessionMode::Auto
+                    }
+                };
+            }
+        }
+    }
+    SessionMode::Auto
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <input.wav> <output.wav> [model_dir]", args[0]);
+        eprintln!("Usage: {} <input.wav> <output.wav> [model_dir] [--mode split|combined|stateless]", args[0]);
         std::process::exit(1);
     }
 
-    let input_path = &args[1];
-    let output_path = &args[2];
-    let model_dir = if args.len() > 3 {
-        Path::new(&args[3]).to_path_buf()
+    let session_mode = parse_session_mode(&args);
+    let positional: Vec<&String> = args[1..].iter()
+        .filter(|a| !a.starts_with('-'))
+        .filter(|a| !["split", "combined", "stateless"].contains(&a.as_str()))
+        .collect();
+    let input_path = positional[0];
+    let output_path = positional[1];
+    let model_dir = if positional.len() > 2 {
+        Path::new(positional[2]).to_path_buf()
     } else {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("models/dfn3_ll")
     };
 
     println!("Loading model from {:?}...", model_dir);
-    let mut processor = DeepFilterProcessor::new(&model_dir)?;
+    let mut processor = DeepFilterProcessor::with_mode(&model_dir, session_mode, Some(2))?;
     processor.warmup()?;
     let variant = processor.variant();
     println!("Using model variant: {}", variant.name());
-    println!("Inference mode: {}", if variant.is_stateful() { "stateful (h0)" } else { "stateless" });
+    println!("Inference mode: {}", processor.inference_mode_name());
 
     // Read input audio
     let mut reader = hound::WavReader::open(input_path)?;

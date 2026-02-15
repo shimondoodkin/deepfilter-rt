@@ -198,6 +198,24 @@ pub const MAX_DB_DF_THRESH: f32 = 35.0;
 /// ~400ms of context at 10ms/frame. Trade-off: more computation per frame but smoother output.
 const STATELESS_WINDOW: usize = 40;
 
+/// Which ONNX session layout to use for inference.
+///
+/// - `Auto` (default): pick the best available from the model directory.
+/// - `SplitStreaming`: 4 separate sessions (enc_conv, enc_gru, erb_dec, df_dec).
+/// - `CombinedStreaming`: single `combined_streaming.onnx` with GRU states.
+/// - `Stateless`: single `combined.onnx`, 40-frame window warm-up per frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SessionMode {
+    /// Auto-detect best mode from files in model directory (default).
+    Auto,
+    /// Split streaming: 4 separate ONNX sessions with explicit GRU state I/O.
+    SplitStreaming,
+    /// Combined streaming: single `combined_streaming.onnx` with GRU states.
+    CombinedStreaming,
+    /// Stateless: single `combined.onnx`, no persistent GRU state.
+    Stateless,
+}
+
 /// Internal inference mode (derived from ModelVariant).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum InferenceMode {
@@ -374,14 +392,11 @@ pub struct DeepFilterProcessor {
 impl DeepFilterProcessor {
     /// Create processor from model directory.
     ///
-    /// Auto-detects model variant from folder name and config.ini.
-    ///
-    /// The directory should contain:
-    /// - enc.onnx, erb_dec.onnx, df_dec.onnx
-    /// - config.ini (for variant detection)
+    /// Auto-detects model variant and session mode from folder name, config.ini,
+    /// and available ONNX files.
     pub fn new(model_dir: &Path) -> Result<Self> {
         let variant = ModelVariant::from_model_dir(model_dir).unwrap_or(ModelVariant::DeepFilterNet3);
-        Self::with_variant_and_threads(model_dir, variant, Some(2))
+        Self::build(model_dir, variant, Some(2), SessionMode::Auto)
     }
 
     /// Create processor with explicit thread count.
@@ -391,7 +406,7 @@ impl DeepFilterProcessor {
     /// - For batch/offline: use 4+ for throughput
     pub fn with_threads(model_dir: &Path, intra_threads: usize) -> Result<Self> {
         let variant = ModelVariant::from_model_dir(model_dir).unwrap_or(ModelVariant::DeepFilterNet3);
-        Self::with_variant_and_threads(model_dir, variant, Some(intra_threads))
+        Self::build(model_dir, variant, Some(intra_threads), SessionMode::Auto)
     }
 
     /// Create processor with explicit variant and thread count.
@@ -402,7 +417,21 @@ impl DeepFilterProcessor {
         variant: ModelVariant,
         intra_threads: Option<usize>,
     ) -> Result<Self> {
-        Self::build(model_dir, variant, intra_threads)
+        Self::build(model_dir, variant, intra_threads, SessionMode::Auto)
+    }
+
+    /// Create processor with explicit session mode, variant, and thread count.
+    ///
+    /// Use [`SessionMode::SplitStreaming`], [`SessionMode::CombinedStreaming`], or
+    /// [`SessionMode::Stateless`] to force a specific inference mode regardless of
+    /// which files exist.
+    pub fn with_mode(
+        model_dir: &Path,
+        session_mode: SessionMode,
+        intra_threads: Option<usize>,
+    ) -> Result<Self> {
+        let variant = ModelVariant::from_model_dir(model_dir).unwrap_or(ModelVariant::DeepFilterNet3);
+        Self::build(model_dir, variant, intra_threads, session_mode)
     }
 
     /// Internal builder with all parameters.
@@ -410,6 +439,7 @@ impl DeepFilterProcessor {
         model_dir: &Path,
         variant: ModelVariant,
         intra_threads: Option<usize>,
+        session_mode: SessionMode,
     ) -> Result<Self> {
         init_ort()?;
         let inference_mode = variant.inference_mode();
@@ -538,11 +568,9 @@ impl DeepFilterProcessor {
             Ok(builder.commit_from_file(path)?)
         };
 
-        // Detect streaming mode: split encoder files exist
+        // Model file paths
         let enc_conv_path = model_dir.join("enc_conv_streaming.onnx");
         let enc_gru_path = model_dir.join("enc_gru_streaming.onnx");
-        // Streaming decoders: prefer *_streaming.onnx (coexists with originals),
-        // fall back to erb_dec.onnx/df_dec.onnx for backward compatibility
         let erb_dec_streaming_path = model_dir.join("erb_dec_streaming.onnx");
         let df_dec_streaming_path = model_dir.join("df_dec_streaming.onnx");
         let erb_dec_path = if erb_dec_streaming_path.exists() {
@@ -558,42 +586,77 @@ impl DeepFilterProcessor {
         let combined_streaming_path = model_dir.join("combined_streaming.onnx");
         let combined_path = model_dir.join("combined.onnx");
 
-        let (sessions, inference_mode) = if enc_conv_path.exists() && enc_gru_path.exists()
-            && erb_dec_path.exists() && df_dec_path.exists()
-        {
+        let has_split = enc_conv_path.exists() && enc_gru_path.exists()
+            && erb_dec_path.exists() && df_dec_path.exists();
+        let has_combined_streaming = combined_streaming_path.exists();
+        let has_combined = combined_path.exists();
+
+        let load_split = || -> Result<(Sessions, InferenceMode)> {
+            if !has_split {
+                return Err(DfError::Config(
+                    "Split streaming requested but enc_conv_streaming.onnx / enc_gru_streaming.onnx not found".to_string(),
+                ));
+            }
             log::info!("Loading streaming model (split encoder + separate decoders)");
-            // Split streaming always uses StatefulH0 (GRU states are persistent)
-            (Sessions::Streaming {
-                enc_conv: build_session(enc_conv_path)?,
-                enc_gru: build_session(enc_gru_path)?,
-                erb_dec: build_session(erb_dec_path)?,
-                df_dec: build_session(df_dec_path)?,
-            }, InferenceMode::StatefulH0)
-        } else if combined_streaming_path.exists() {
-            // Patched streaming model: combined.onnx with GRU states exposed
-            let session = build_session(combined_streaming_path)?;
+            Ok((Sessions::Streaming {
+                enc_conv: build_session(enc_conv_path.clone())?,
+                enc_gru: build_session(enc_gru_path.clone())?,
+                erb_dec: build_session(erb_dec_path.clone())?,
+                df_dec: build_session(df_dec_path.clone())?,
+            }, InferenceMode::StatefulH0))
+        };
+
+        let load_combined_streaming = || -> Result<(Sessions, InferenceMode)> {
+            if !has_combined_streaming {
+                return Err(DfError::Config(
+                    "Combined streaming requested but combined_streaming.onnx not found".to_string(),
+                ));
+            }
+            let session = build_session(combined_streaming_path.clone())?;
             let has_h0 = session.inputs().iter().any(|i| i.name() == "h0");
             if !has_h0 {
                 return Err(DfError::Config(
                     "combined_streaming.onnx exists but has no h0 input".to_string(),
                 ));
             }
-            log::info!("Loading patched streaming model (combined_streaming.onnx)");
-            (Sessions::Combined(session), InferenceMode::StatefulH0)
-        } else if combined_path.exists() {
-            let session = build_session(combined_path)?;
+            log::info!("Loading combined streaming model (combined_streaming.onnx)");
+            Ok((Sessions::Combined(session), InferenceMode::StatefulH0))
+        };
+
+        let load_stateless = || -> Result<(Sessions, InferenceMode)> {
+            if !has_combined {
+                return Err(DfError::Config(
+                    "Stateless mode requested but combined.onnx not found".to_string(),
+                ));
+            }
+            let session = build_session(combined_path.clone())?;
             let has_h0 = session.inputs().iter().any(|i| i.name() == "h0");
             if inference_mode == InferenceMode::StatefulH0 && !has_h0 {
                 return Err(DfError::Config(
                     "Model directory ends with _h0 but encoder has no h0 input".to_string(),
                 ));
             }
-            (Sessions::Combined(session), inference_mode)
-        } else {
-            return Err(DfError::Config(
-                "No model files found. Need either enc_conv_streaming.onnx+enc_gru_streaming.onnx+erb_dec.onnx+df_dec.onnx \
-                 (streaming), combined_streaming.onnx (patched), or combined.onnx (windowed).".to_string(),
-            ));
+            Ok((Sessions::Combined(session), inference_mode))
+        };
+
+        let (sessions, inference_mode) = match session_mode {
+            SessionMode::SplitStreaming => load_split()?,
+            SessionMode::CombinedStreaming => load_combined_streaming()?,
+            SessionMode::Stateless => load_stateless()?,
+            SessionMode::Auto => {
+                if has_split {
+                    load_split()?
+                } else if has_combined_streaming {
+                    load_combined_streaming()?
+                } else if has_combined {
+                    load_stateless()?
+                } else {
+                    return Err(DfError::Config(
+                        "No model files found. Need either enc_conv_streaming.onnx+enc_gru_streaming.onnx+erb_dec.onnx+df_dec.onnx \
+                         (split streaming), combined_streaming.onnx (combined streaming), or combined.onnx (stateless).".to_string(),
+                    ));
+                }
+            }
         };
 
         // enc_window: how many frames of temporal context the encoder convolutions see.
@@ -674,6 +737,19 @@ impl DeepFilterProcessor {
 
     pub fn variant(&self) -> ModelVariant {
         self.variant
+    }
+
+    /// Returns a human-readable name for the active inference mode.
+    ///
+    /// - `"split streaming"` — separate enc_conv/enc_gru/erb_dec/df_dec sessions
+    /// - `"combined streaming"` — single combined_streaming.onnx with GRU states
+    /// - `"stateless window"` — combined.onnx with 40-frame window warm-up
+    pub fn inference_mode_name(&self) -> &'static str {
+        match (&self.sessions, self.inference_mode) {
+            (Sessions::Streaming { .. }, _) => "split streaming",
+            (Sessions::Combined(_), InferenceMode::StatefulH0) => "combined streaming",
+            (Sessions::Combined(_), InferenceMode::StatelessWindowLast) => "stateless window",
+        }
     }
 
     /// Model lookahead in frames (from config.ini conv_lookahead).
@@ -1162,6 +1238,17 @@ impl DeepFilterStream {
         })
     }
 
+    /// Create stream with explicit session mode.
+    ///
+    /// Use [`SessionMode::CombinedStreaming`] or [`SessionMode::Stateless`] to force
+    /// a specific inference mode.
+    pub fn with_mode(model_dir: &Path, session_mode: SessionMode, intra_threads: Option<usize>) -> Result<Self> {
+        Ok(Self {
+            processor: DeepFilterProcessor::with_mode(model_dir, session_mode, intra_threads)?,
+            input_buffer: Vec::with_capacity(HOP_SIZE * 2),
+        })
+    }
+
     /// Create stream with explicit variant and thread count.
     ///
     /// Use when folder name doesn't match model or you need to override detection.
@@ -1255,6 +1342,9 @@ impl DeepFilterStream {
 
     /// Model lookahead in frames (0 for LL, 2 for standard).
     pub fn lookahead(&self) -> usize { self.processor.lookahead() }
+
+    /// Returns a human-readable name for the active inference mode.
+    pub fn inference_mode_name(&self) -> &'static str { self.processor.inference_mode_name() }
 
     /// Access the underlying processor for advanced use.
     pub fn processor_mut(&mut self) -> &mut DeepFilterProcessor {

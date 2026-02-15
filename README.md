@@ -2,6 +2,96 @@
 
 Real-time speech enhancement using [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) with ONNX Runtime in Rust.
 
+## quick start:
+
+this works fast in high quality, with no hiccups.
+10 ms data 20ms lookahead.
+per frame: avg: **1.70ms**, max: 5.21ms
+
+
+```
+
+cargo run --example process_file -- example1_48k.wav example1_test1.wav models/dfn3 --mode combined
+
+cargo run --example realtime -- example1_48k.wav example1_test1.wav models/dfn3 --mode combined
+
+cargo run --example piplined -- example1_48k.wav example1_test1.wav models/dfn3 --mode combined
+
+
+output:
+
+$ cargo run --example pipelined -- example1_48k.wav example1_test1.wav models/dfn3 --mode combined
+warning: deepfilter-rt@0.1.0: Copied onnxruntime.dll to C:\Users\user\Documents\projects\aiphone\deepfilter_rt\target\debug
+warning: deepfilter-rt@0.1.0: Copied onnxruntime.dll to C:\Users\user\Documents\projects\aiphone\deepfilter_rt\target\debug\examples
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running `target\debug\examples\pipelined.exe example1_48k.wav example1_test1.wav models/dfn3 --mode combined`
+Input: 48000 Hz, 1 ch, Int
+Processing 3400 frames (34.01s) with pipelined threads...
+DeepFilter ready: DeepFilterNet3 [combined streaming] (budget: 10.00ms/frame)
+[DEBUG] producer done, job_tx dropped
+Consumer stats: 3400 frames, avg: 1.70ms, max: 5.21ms
+[DEBUG] collected 3400 results, waiting for df_thread join
+[DEBUG] df_thread joined
+Done in 7.10s (RTF: 0.209x realtime, underruns: 0)
+Saved to example1_test1.wav
+Latency CSV written to example1_test1.wav.csv
+
+$ cargo run --example realtime -- example1_48k.wav example1_test1.wav models/dfn3 --mode combined
+warning: deepfilter-rt@0.1.0: Copied onnxruntime.dll to C:\Users\user\Documents\projects\aiphone\deepfilter_rt\target\debug
+warning: deepfilter-rt@0.1.0: Copied onnxruntime.dll to C:\Users\user\Documents\projects\aiphone\deepfilter_rt\target\debug\examples
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running `target\debug\examples\realtime.exe example1_48k.wav example1_test1.wav models/dfn3 --mode combined`
+Loading model from "models/dfn3"...
+Using model variant: DeepFilterNet3
+Inference mode: combined streaming
+Input: 48000 Hz, 1 channels, Int
+Processing 1632255 samples (34.01s) with streaming... (budget: 10.00ms/frame)
+Done in 5.69s (RTF: 0.167x realtime)
+Frames: 3400, avg: 1.66ms, max: 5.09ms, underruns: 0
+Saved to example1_test1.wav
+Latency CSV written to example1_test1.wav.csv
+
+
+$ cargo run --example process_file -- example1_48k.wav example1_test1.wav models/dfn3 --mode combined
+warning: deepfilter-rt@0.1.0: Copied onnxruntime.dll to C:\Users\user\Documents\projects\aiphone\deepfilter_rt\target\debug
+warning: deepfilter-rt@0.1.0: Copied onnxruntime.dll to C:\Users\user\Documents\projects\aiphone\deepfilter_rt\target\debug\examples
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running `target\debug\examples\process_file.exe example1_48k.wav example1_test1.wav models/dfn3 --mode combined`
+Loading model from "models/dfn3"...
+Using model variant: DeepFilterNet3
+Inference mode: combined streaming
+Lookahead: 2 frames (30ms delay)
+Algorithmic delay: 1440 samples (30.0ms)
+Input: 48000 Hz, 1 channels, Int
+Processing 1632255 samples (34.01s)...
+Done in 5.68s (RTF: 0.167x realtime)
+Saved 1632255 samples to example1_test1.wav
+Latency CSV written to example1_test1.wav.csv
+
+```
+
+
+low latency variant:
+
+```
+
+
+Running `target\debug\examples\pipelined.exe example1_48k.wav example1_test1.wav models/dfn3_ll --mode combined`
+Input: 48000 Hz, 1 ch, Int
+Processing 3400 frames (34.01s) with pipelined threads...
+DeepFilter ready: DeepFilterNet3-LL [combined streaming] (budget: 10.00ms/frame)
+[DEBUG] producer done, job_tx dropped
+Consumer stats: 3400 frames, avg: 3.32ms, max: 8.49ms
+[DEBUG] collected 3400 results, waiting for df_thread join
+[DEBUG] df_thread joined
+Done in 12.51s (RTF: 0.368x realtime, underruns: 0)
+Saved to example1_test1.wav
+Latency CSV written to example1_test1.wav.csv
+
+```
+
+
+
 ## Overview
 
 This crate provides frame-by-frame audio denoising using the DeepFilterNet neural network. It supports multiple streaming inference modes with persistent GRU state for smooth, real-time output, combining:
@@ -32,9 +122,11 @@ Audio Frame (480 samples @ 48kHz = 10ms)
     └────────┬─────────┘
              ▼
 ┌─────────────────────────────────────┐
-│  4. COMBINED MODEL (combined.onnx)  │
-│     Single ONNX session:            │
-│     encoder + ERB decoder + DF dec  │
+│  4. NEURAL NETWORK INFERENCE        │
+│     Split streaming (recommended):  │
+│       enc_conv → enc_gru →          │
+│       erb_dec + df_dec              │
+│     Or combined.onnx (fallback)     │
 │     → mask [32], coefs [5,96,2],    │
 │       lsnr [1]                      │
 └─────────────────────────────────────┘
@@ -53,7 +145,7 @@ Audio Frame (480 samples @ 48kHz = 10ms)
 └─────────────────────────────────────┘
 ```
 
-The three original ONNX models (encoder, ERB decoder, DF decoder) are pre-merged into a single `combined.onnx` per variant. This reduces per-frame overhead from 3 ORT dispatches to 1.
+The code auto-detects the best available inference mode from the model directory (split streaming > combined streaming > stateless combined).
 
 ## Model Variants
 
@@ -94,11 +186,12 @@ deepfilter-rt = { git = "https://github.com/shimondoodkin/deepfilter-rt" }
 ### Requirements
 
 - ONNX Runtime dynamic library (auto-downloaded by `ort` on desktop, or provide `libonnxruntime.so` for Android)
-- Model files per variant (included in `models/`):
+- Model files per variant (all included in `models/`):
   - `config.ini` (always required)
-  - `combined_streaming.onnx` (patched streaming mode, recommended), or
-  - `enc_conv_streaming.onnx` + `enc_gru_streaming.onnx` + `erb_dec_streaming.onnx` + `df_dec_streaming.onnx` (split streaming), or
-  - `combined.onnx` (stateless fallback)
+  - `enc_conv_streaming.onnx` + `enc_gru_streaming.onnx` + `erb_dec_streaming.onnx` + `df_dec_streaming.onnx` (split streaming, highest priority)
+  - `combined_streaming.onnx` (combined streaming, used if split files missing)
+  - `combined.onnx` (stateless fallback, used if no streaming files)
+  - The code auto-detects the best available mode
 
 ## Usage
 
@@ -176,8 +269,11 @@ Enable via Cargo features:
 
 ```toml
 [dependencies]
-# NVIDIA GPU (CUDA) — default
+# CPU only (default — no GPU features enabled)
 deepfilter-rt = { git = "..." }
+
+# NVIDIA GPU (CUDA)
+deepfilter-rt = { git = "...", features = ["cuda"] }
 
 # Android GPU/NPU (NNAPI)
 deepfilter-rt = { git = "...", features = ["nnapi"] }
@@ -187,9 +283,6 @@ deepfilter-rt = { git = "...", features = ["nnapi", "fp16"] }
 
 # iOS/macOS (CoreML)
 deepfilter-rt = { git = "...", features = ["coreml"] }
-
-# CPU only (no GPU features)
-deepfilter-rt = { git = "...", default-features = false }
 ```
 
 ### fp16 Pipeline
@@ -210,12 +303,17 @@ The API remains f32 throughout. The fp16 benefit is faster matrix ops on NPU/GPU
 # Process a WAV file (high-level streaming API)
 cargo run --example process_file -- input.wav output.wav models/dfn3_ll
 
+# With delay compensation (trim algorithmic delay, matches Tract -D flag)
+cargo run --example process_file -- input.wav output.wav models/dfn3_ll -D
+
 # Simulated realtime streaming
 cargo run --example realtime -- input.wav output.wav models/dfn3_ll
 
 # Pipelined threading (producer/consumer pattern)
 cargo run --example pipelined -- input.wav output.wav models/dfn3_ll
 ```
+
+All examples write a per-frame latency CSV alongside the output (e.g. `output.wav.csv`).
 
 ## Splitting Models for Streaming (Recommended)
 
@@ -229,7 +327,7 @@ python scripts/split_encoder_and_patch_decoders.py models/dfn3 models/dfn3_ll mo
 # The Rust code auto-detects and uses them (highest priority)
 ```
 
-This produces split streaming models that match Tract reference output with 47.7 dB SNR (DFN3).
+This produces split streaming models that match Tract reference output with 47.6 dB SNR (DFN3).
 
 ### Legacy: Patching combined.onnx
 
@@ -241,6 +339,14 @@ python scripts/patch_onnx_streaming.py models/dfn3 models/dfn2 models/dfn3_ll mo
 ```
 
 See `MODES.md` for details on all inference modes.
+
+### Merging Split Models into Combined Streaming
+
+To merge the 4 split streaming files back into a single `combined_streaming.onnx`:
+
+```bash
+python scripts/merge_split_models.py models/dfn3
+```
 
 ## Merging Models
 
@@ -278,6 +384,7 @@ All models process within the 10ms frame budget on CPU. Combined with flat ring 
 |-------|------|-----|---------------|----------|
 | dfn3 | Combined streaming | 0.11x | 0.999991 | 47.6 |
 | dfn3 | Split streaming | 0.34x | 0.999991 | 47.6 |
+| dfn3_h0 | Split streaming | 0.34x | 0.999991 | 47.6 |
 | dfn3_ll | Split streaming | 0.82x | 0.999605 | 31.0 |
 
 RTF = Real-Time Factor (< 1.0 means faster than real-time). Both split and combined streaming achieve near-perfect match to Tract reference output.
@@ -288,7 +395,8 @@ The `with_threads` constructors control ONNX Runtime's intra-op parallelism:
 
 - **Real-time audio**: Use 1-2 threads to minimize latency jitter
 - **Batch/offline**: Use more threads (4-8) for throughput
-- **Default**: 2 threads
+- **Default**: 2 threads (via `new()`)
+- Pass `None` to `with_variant_and_threads()` to let ONNX Runtime choose based on CPU cores
 
 ## Android Setup
 
@@ -306,15 +414,19 @@ High-level streaming wrapper with internal buffering.
 
 | Method | Description |
 |--------|-------------|
-| `new(model_dir)` | Load from directory (auto-detect variant) |
+| `new(model_dir)` | Load from directory (auto-detect variant, 2 threads) |
 | `with_threads(model_dir, n)` | With explicit thread count |
+| `with_variant_and_threads(model_dir, variant, threads)` | Override variant and thread count |
 | `process(input) -> Vec<f32>` | Process any chunk size |
 | `flush() -> Vec<f32>` | Get remaining samples at end of stream |
 | `warmup()` | Warm up inference engine |
 | `reset()` | Reset state between streams |
 | `latency_ms() -> f32` | Total algorithmic latency |
+| `delay_samples() -> usize` | Algorithmic delay in samples |
+| `lookahead() -> usize` | Model lookahead in frames (0 for LL, 2 for standard) |
 | `sample_rate() -> usize` | Always 48000 |
 | `variant() -> ModelVariant` | Get model type |
+| `processor_mut() -> &mut DeepFilterProcessor` | Access underlying processor |
 
 ### `DeepFilterProcessor`
 
@@ -322,11 +434,14 @@ Low-level frame processor for audio callbacks.
 
 | Method | Description |
 |--------|-------------|
-| `new(model_dir)` | Load from directory |
+| `new(model_dir)` | Load from directory (auto-detect variant, 2 threads) |
 | `with_threads(model_dir, n)` | With explicit thread count |
+| `with_variant_and_threads(model_dir, variant, threads)` | Override variant and thread count |
 | `process_frame(input, output)` | Process one 480-sample frame |
 | `warmup()` | Warm up inference engine |
 | `reset()` | Reset all states |
+| `delay_samples() -> usize` | Algorithmic delay in samples |
+| `lookahead() -> usize` | Model lookahead in frames (0 for LL, 2 for standard) |
 | `variant() -> ModelVariant` | Get model type |
 
 ### `ModelVariant`
@@ -338,6 +453,18 @@ Auto-detected from folder name and `config.ini`.
 | `name() -> &str` | e.g. "DeepFilterNet3-LL" |
 | `is_low_latency() -> bool` | 10ms vs 30ms |
 | `is_stateful() -> bool` | Has GRU hidden state |
+
+## Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `split_encoder_and_patch_decoders.py` | Create split streaming ONNX files (recommended) |
+| `merge_split_models.py` | Merge 4 split files into `combined_streaming.onnx` |
+| `merge_onnx.py` | Merge enc/erb_dec/df_dec into `combined.onnx` |
+| `patch_onnx_streaming.py` | Legacy: patch combined.onnx for streaming |
+| `export_onnx_stateful.py` | PyTorch export for stateful ONNX models |
+| `compare_wav.py` | Compare WAV files (correlation, SNR) for benchmarking |
+| `build_onnxsim.py` | Build onnxsim from source (for Python 3.12+/Windows) |
 
 ## More Docs
 

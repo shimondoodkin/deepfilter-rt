@@ -9,9 +9,9 @@
 //!   Audio thread  ──(channel)──►  DeepFilter thread
 //!                                   (ONNX inference)
 //!
-//! Usage: cargo run --example pipelined -- input.wav output.wav [model_dir]
+//! Usage: cargo run --example pipelined -- input.wav output.wav [model_dir] [--mode split|combined|stateless]
 
-use deepfilter_rt::{DeepFilterProcessor, HOP_SIZE, SAMPLE_RATE};
+use deepfilter_rt::{DeepFilterProcessor, SessionMode, HOP_SIZE, SAMPLE_RATE};
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,17 +30,41 @@ struct DenoiseResult {
     denoised: Vec<f32>,
 }
 
+fn parse_session_mode(args: &[String]) -> SessionMode {
+    for (i, a) in args.iter().enumerate() {
+        if a == "--mode" {
+            if let Some(val) = args.get(i + 1) {
+                return match val.as_str() {
+                    "split" => SessionMode::SplitStreaming,
+                    "combined" => SessionMode::CombinedStreaming,
+                    "stateless" => SessionMode::Stateless,
+                    other => {
+                        eprintln!("Unknown mode '{}', using auto. Options: split, combined, stateless", other);
+                        SessionMode::Auto
+                    }
+                };
+            }
+        }
+    }
+    SessionMode::Auto
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <input.wav> <output.wav> [model_dir]", args[0]);
+        eprintln!("Usage: {} <input.wav> <output.wav> [model_dir] [--mode split|combined|stateless]", args[0]);
         std::process::exit(1);
     }
 
-    let input_path = &args[1];
-    let output_path = &args[2];
-    let model_dir = if args.len() > 3 {
-        Path::new(&args[3]).to_path_buf()
+    let session_mode = parse_session_mode(&args);
+    let positional: Vec<&String> = args[1..].iter()
+        .filter(|a| !a.starts_with('-'))
+        .filter(|a| !["split", "combined", "stateless"].contains(&a.as_str()))
+        .collect();
+    let input_path = positional[0];
+    let output_path = positional[1];
+    let model_dir = if positional.len() > 2 {
+        Path::new(positional[2]).to_path_buf()
     } else {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("models/dfn3_ll")
     };
@@ -79,21 +103,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ── Channels ──────────────────────────────────────────────────────
-    // Bounded channel prevents unbounded memory growth if producer is faster.
-    // 500 slots ≈ 5 seconds of buffering at 10ms frames.
+    // Job channel is bounded to limit memory if producer outpaces consumer.
+    // Result channel is unbounded because the main thread drains it only
+    // after the producer loop finishes — a bounded result channel would
+    // deadlock once both channels fill up.
     let (job_tx, job_rx) = mpsc::sync_channel::<DenoiseJob>(500);
-    let (result_tx, result_rx) = mpsc::sync_channel::<DenoiseResult>(500);
+    let (result_tx, result_rx) = mpsc::channel::<DenoiseResult>();
 
     let underrun_count = Arc::new(AtomicU64::new(0));
     let underrun_count_thread = Arc::clone(&underrun_count);
 
     // ── DeepFilter consumer thread ────────────────────────────────────
     let df_thread = std::thread::spawn(move || -> Vec<u64> {
-        let mut proc = DeepFilterProcessor::new(&model_dir).expect("load DeepFilter model");
+        let mut proc = DeepFilterProcessor::with_mode(&model_dir, session_mode, Some(2))
+            .expect("load DeepFilter model");
         proc.warmup().expect("DeepFilter warmup");
         let frame_budget = std::time::Duration::from_secs_f64(HOP_SIZE as f64 / SAMPLE_RATE as f64);
-        eprintln!("DeepFilter ready: {} (budget: {:.2}ms/frame)",
-                  proc.variant().name(), frame_budget.as_secs_f64() * 1000.0);
+        eprintln!("DeepFilter ready: {} [{}] (budget: {:.2}ms/frame)",
+                  proc.variant().name(), proc.inference_mode_name(),
+                  frame_budget.as_secs_f64() * 1000.0);
 
         let mut denoised = vec![0.0f32; HOP_SIZE];
         let mut max_frame_time = std::time::Duration::ZERO;
